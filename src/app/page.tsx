@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback, useRef } from "react";
 import {
   AreaChart,
   Area,
@@ -595,6 +595,15 @@ async function generateDocxReport(params: {
   return await Packer.toBlob(doc);
 }
 
+/* ─────────── Keyword Import Helpers ─────────── */
+function parseBulkKeywords(text: string, existing: string[]): string[] {
+  return text
+    .split(/[\n,]+/)
+    .map((k) => k.trim())
+    .filter((k) => k.length > 0 && !existing.includes(k))
+    .filter((k, i, arr) => arr.indexOf(k) === i); // deduplicate within batch
+}
+
 /* ─────────── UI Components ─────────── */
 function Badge({ children, variant = "default" }: { children: React.ReactNode; variant?: "default" | "accent" | "muted" }) {
   const cls =
@@ -676,6 +685,11 @@ export default function TrendPulse() {
   const [saveNameInput, setSaveNameInput] = useState("");
   const [showSaveInput, setShowSaveInput] = useState(false);
   const [showSaved, setShowSaved] = useState(true);
+
+  /* ── Bulk / file import ── */
+  const [showBulkInput, setShowBulkInput] = useState(false);
+  const [bulkText, setBulkText] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   /* ── Keyword management ── */
   const addKeyword = useCallback((raw: string) => {
@@ -762,6 +776,28 @@ export default function TrendPulse() {
       return next;
     });
   }, []);
+
+  /* ── Bulk / file keyword import ── */
+  const handleBulkAdd = useCallback(() => {
+    const toAdd = parseBulkKeywords(bulkText, keywords);
+    if (!toAdd.length) return;
+    setKeywords((prev) => [...prev, ...toAdd].slice(0, MAX_KEYWORDS));
+    setBulkText("");
+    setShowBulkInput(false);
+  }, [bulkText, keywords]);
+
+  const handleFileImport = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const text = (ev.target?.result as string) ?? "";
+      const toAdd = parseBulkKeywords(text, keywords);
+      if (toAdd.length) setKeywords((prev) => [...prev, ...toAdd].slice(0, MAX_KEYWORDS));
+    };
+    reader.readAsText(file);
+    e.target.value = ""; // reset so the same file can be re-imported
+  }, [keywords]);
 
   /* ── Derived data ── */
   const flatData = useMemo(
@@ -1004,6 +1040,74 @@ export default function TrendPulse() {
                 className="w-full px-4 py-3 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)] transition-colors font-medium disabled:opacity-40"
               />
               <p className="text-[10px] text-[var(--text-muted)] mt-1">Enter or comma to add · Backspace to remove last</p>
+
+              {/* Import buttons */}
+              <div className="flex items-center gap-2 mt-2">
+                <button
+                  type="button"
+                  onClick={() => { setShowBulkInput((v) => !v); setBulkText(""); }}
+                  disabled={keywords.length >= MAX_KEYWORDS}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-medium border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  📋 Bulk add
+                </button>
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={keywords.length >= MAX_KEYWORDS}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-medium border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  📁 Import file
+                </button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".txt,.csv,.tsv"
+                  className="hidden"
+                  onChange={handleFileImport}
+                />
+                <span className="ml-auto text-[10px] text-[var(--text-muted)]">
+                  .txt · .csv · comma or newline separated
+                </span>
+              </div>
+
+              {/* Bulk textarea */}
+              {showBulkInput && (() => {
+                const preview = parseBulkKeywords(bulkText, keywords);
+                const remaining = MAX_KEYWORDS - keywords.length;
+                const addCount = Math.min(preview.length, remaining);
+                return (
+                  <div className="mt-2 rounded-xl border border-[var(--accent)]/30 bg-[var(--bg-secondary)] p-3 space-y-2">
+                    <div className="text-[10px] uppercase tracking-widest text-[var(--accent)] font-semibold">Bulk add keywords</div>
+                    <textarea
+                      value={bulkText}
+                      onChange={(e) => setBulkText(e.target.value)}
+                      placeholder={"Bitcoin, Ethereum, ChatGPT\nClimate Change\nTaylor Swift, Dogecoin"}
+                      rows={4}
+                      autoFocus
+                      className="w-full px-3 py-2 rounded-lg bg-[var(--bg-primary)] border border-[var(--border)] text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)] transition-colors font-mono text-xs resize-none"
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={handleBulkAdd}
+                        disabled={addCount === 0}
+                        className="px-4 py-1.5 rounded-lg bg-[var(--accent)] text-[var(--bg-primary)] text-xs font-semibold hover:bg-[var(--accent-dim)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                      >
+                        {addCount > 0 ? `Add ${addCount} keyword${addCount !== 1 ? "s" : ""}` : "No new keywords"}
+                      </button>
+                      <button
+                        onClick={() => { setShowBulkInput(false); setBulkText(""); }}
+                        className="px-3 py-1.5 rounded-lg border border-[var(--border)] text-[var(--text-muted)] text-xs hover:text-[var(--danger)] hover:border-[var(--danger)]/40 transition-colors"
+                      >
+                        Cancel
+                      </button>
+                      <span className="ml-auto text-[10px] text-[var(--text-muted)] font-mono">
+                        {addCount} new · {remaining} slots left
+                      </span>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
 
             {/* Date mode toggle */}
