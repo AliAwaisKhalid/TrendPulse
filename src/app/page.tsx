@@ -1631,7 +1631,6 @@ export default function TrendPulse() {
               <span className="font-mono">{toISODate(range.start)} → {toISODate(range.end)}</span>
             )}
             <span>≈ {(estPoints * Math.max(1, keywords.length)).toLocaleString()} data points</span>
-            <span className="ml-auto">Simulated data • R script exports {freq} + daily CSVs per keyword</span>
           </div>
         </section>
 
