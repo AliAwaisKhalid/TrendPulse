@@ -6,6 +6,9 @@ import {
   Area,
   LineChart,
   Line,
+  ComposedChart,
+  Bar,
+  Cell,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -381,6 +384,18 @@ function computeStats(hits: number[]): FullStats | null {
   return { n, mean, median, variance, stdDev, skewness, kurtosis, min: sorted[0], max: sorted[n - 1] };
 }
 
+/* ─────────── PCA Types ─────────── */
+interface PCAResult {
+  nObs: number;
+  nVars: number;
+  eigenvalues: number[];
+  explainedVar: number[];   // proportion per PC, sum = 1
+  cumulativeVar: number[];  // cumulative
+  loadings: number[][];     // loadings[pcIdx][kwIdx]
+  scores: number[][];       // scores[obsIdx][pcIdx]
+  labels: string[];         // keyword names
+}
+
 /* ─────────── Saved Analyses ─────────── */
 interface SavedAnalysis {
   id: string;
@@ -434,8 +449,9 @@ async function generateDocxReport(params: {
   fullStats: FullStats;
   beforeStats: FullStats | null;
   afterStats: FullStats | null;
+  pcaResult: PCAResult | null;
 }): Promise<Blob> {
-  const { keywords, startDate, endDate, freq, geo, flatData, cutoffDate, kwStats, fullStats, beforeStats, afterStats } = params;
+  const { keywords, startDate, endDate, freq, geo, flatData, cutoffDate, kwStats, fullStats, beforeStats, afterStats, pcaResult } = params;
   const country = COUNTRIES[geo] || "Worldwide";
   const now = new Date().toLocaleString();
 
@@ -561,7 +577,55 @@ async function generateDocxReport(params: {
     );
   }
 
-  const varSection = cutoffDate ? "6" : "5";
+  /* PCA section */
+  if (pcaResult) {
+    const pcaSection = cutoffDate ? "6" : "5";
+    const showPCs = Math.min(pcaResult.nVars, 8);
+    children.push(
+      divider(),
+      h(`${pcaSection}. Principal Component Analysis`, HeadingLevel.HEADING_1),
+      p(
+        `PCA was applied to the standardized time series of all ${pcaResult.nVars} keyword(s) ` +
+        `(${pcaResult.nObs.toLocaleString()} observations). The correlation matrix was decomposed ` +
+        `using the Jacobi eigenvalue algorithm. PC1 explains ` +
+        `${(pcaResult.explainedVar[0] * 100).toFixed(1)}% of total variance; ` +
+        `the first two components together explain ` +
+        `${(pcaResult.cumulativeVar[Math.min(1, pcaResult.nVars - 1)] * 100).toFixed(1)}%.`
+      ),
+      h("Explained Variance", HeadingLevel.HEADING_2),
+      new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        rows: [
+          ["PC", "Eigenvalue", "% Variance", "Cumulative %"],
+          ...pcaResult.eigenvalues.map((ev, i) => [
+            `PC${i + 1}`,
+            ev.toFixed(4),
+            `${(pcaResult.explainedVar[i] * 100).toFixed(2)}%`,
+            `${(pcaResult.cumulativeVar[i] * 100).toFixed(2)}%`,
+          ]),
+        ].map((r, i) =>
+          new TableRow({ children: r.map((cell, ci) => docCell(cell, i === 0, i === 0 ? "c8f0e0" : ci % 2 === 0 ? "f5f5f8" : "ffffff")) })
+        ),
+      }),
+      new Paragraph({ text: "", spacing: { after: 200 } }),
+      h("Component Loadings (Keyword × PC)", HeadingLevel.HEADING_2),
+      p("Values show how strongly each keyword drives each principal component. Larger absolute values indicate stronger influence."),
+      new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        rows: [
+          ["Keyword", ...Array.from({ length: showPCs }, (_, i) => `PC${i + 1}`)],
+          ...pcaResult.labels.map((kw, kwIdx) => [
+            kw,
+            ...Array.from({ length: showPCs }, (_, pcIdx) => pcaResult.loadings[pcIdx][kwIdx].toFixed(3)),
+          ]),
+        ].map((r, i) =>
+          new TableRow({ children: r.map((cell, ci) => docCell(cell, i === 0, i === 0 ? "c8f0e0" : ci === 0 ? "e8f5ee" : ci % 2 === 0 ? "f5f5f8" : "ffffff")) })
+        ),
+      }),
+    );
+  }
+
+  const varSection = cutoffDate ? (pcaResult ? "7" : "6") : (pcaResult ? "6" : "5");
   children.push(
     divider(),
     h(`${varSection}. Notes on Variance Extraction`, HeadingLevel.HEADING_1),
@@ -593,6 +657,103 @@ async function generateDocxReport(params: {
     sections: [{ children }],
   });
   return await Packer.toBlob(doc);
+}
+
+/* ─────────── PCA Computation ─────────── */
+/** Jacobi eigendecomposition for a real symmetric matrix. Returns eigenvalues
+ *  sorted descending and corresponding eigenvectors (as rows of the returned
+ *  vectors array, i.e. vectors[pcIdx][varIdx]). */
+function jacobiEigen(matrix: number[][]): { values: number[]; vectors: number[][] } {
+  const n = matrix.length;
+  const a = matrix.map((r) => [...r]);
+  // V accumulates rotations; starts as identity
+  const V: number[][] = Array.from({ length: n }, (_, i) =>
+    Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))
+  );
+  for (let iter = 0; iter < 100 * n * n; iter++) {
+    // Find max off-diagonal |a[p][q]|
+    let max = 0, p = 0, q = 1;
+    for (let i = 0; i < n - 1; i++)
+      for (let j = i + 1; j < n; j++)
+        if (Math.abs(a[i][j]) > max) { max = Math.abs(a[i][j]); p = i; q = j; }
+    if (max < 1e-12) break;
+    // Givens rotation angle
+    const theta = (a[q][q] - a[p][p]) / (2 * a[p][q]);
+    const t = theta >= 0
+      ? 1 / (theta + Math.sqrt(1 + theta * theta))
+      : 1 / (theta - Math.sqrt(1 + theta * theta));
+    const c = 1 / Math.sqrt(1 + t * t);
+    const s = t * c;
+    const ap = a[p].slice(), aq = a[q].slice();
+    for (let i = 0; i < n; i++) {
+      if (i !== p && i !== q) {
+        a[p][i] = a[i][p] = c * ap[i] - s * aq[i];
+        a[q][i] = a[i][q] = s * ap[i] + c * aq[i];
+      }
+    }
+    a[p][p] = c * c * ap[p] - 2 * s * c * ap[q] + s * s * aq[q];
+    a[q][q] = s * s * ap[p] + 2 * s * c * ap[q] + c * c * aq[q];
+    a[p][q] = a[q][p] = 0;
+    for (let i = 0; i < n; i++) {
+      const vp = V[i][p], vq = V[i][q];
+      V[i][p] = c * vp - s * vq;
+      V[i][q] = s * vp + c * vq;
+    }
+  }
+  const vals = a.map((r, i) => r[i]);
+  const ord = vals.map((_, i) => i).sort((i, j) => vals[j] - vals[i]);
+  // Return eigenvectors as rows (vectors[pcIdx][varIdx])
+  return {
+    values: ord.map((i) => vals[i]),
+    vectors: ord.map((i) => V.map((row) => row[i])),
+  };
+}
+
+function computePCA(kwLabels: string[], dataByKw: Record<string, TrendRow[]>): PCAResult | null {
+  const kws = kwLabels.filter((k) => dataByKw[k]?.length);
+  if (kws.length < 2) return null;
+  const nObs = dataByKw[kws[0]].length;
+  if (nObs < 3) return null;
+  const p = kws.length;
+
+  // Build n×p matrix
+  const X: number[][] = Array.from({ length: nObs }, (_, i) =>
+    kws.map((kw) => dataByKw[kw][i]?.hits ?? 0)
+  );
+
+  // Column means and standard deviations
+  const means = kws.map((_, j) => X.reduce((s, r) => s + r[j], 0) / nObs);
+  const stds = kws.map((_, j) => {
+    const m = means[j];
+    const v = X.reduce((s, r) => s + (r[j] - m) ** 2, 0) / (nObs - 1);
+    return Math.sqrt(v) || 1;
+  });
+
+  // Standardize (Z-score per column)
+  const Xs = X.map((row) => row.map((x, j) => (x - means[j]) / stds[j]));
+
+  // Correlation matrix (p×p)
+  const C: number[][] = Array.from({ length: p }, () => new Array(p).fill(0));
+  for (let i = 0; i < p; i++)
+    for (let j = i; j < p; j++) {
+      let sum = 0;
+      for (let k = 0; k < nObs; k++) sum += Xs[k][i] * Xs[k][j];
+      C[i][j] = C[j][i] = sum / (nObs - 1);
+    }
+
+  const { values, vectors } = jacobiEigen(C);
+  const total = values.reduce((s, v) => s + Math.max(0, v), 0) || 1;
+  const explainedVar = values.map((v) => Math.max(0, v) / total);
+  const cumulativeVar = explainedVar.map((_, i) =>
+    explainedVar.slice(0, i + 1).reduce((s, v) => s + v, 0)
+  );
+
+  // PC scores: Xs × V  (n×p)
+  const scores = Xs.map((row) =>
+    vectors.map((vec) => vec.reduce((s, v, j) => s + v * row[j], 0))
+  );
+
+  return { nObs, nVars: p, eigenvalues: values, explainedVar, cumulativeVar, loadings: vectors, scores, labels: kws };
 }
 
 /* ─────────── Keyword Import Helpers ─────────── */
@@ -674,7 +835,7 @@ export default function TrendPulse() {
   const pageSize = 25;
 
   /* ── Tab state ── */
-  const [activeTab, setActiveTab] = useState<"chart" | "table" | "exports">("chart");
+  const [activeTab, setActiveTab] = useState<"chart" | "table" | "pca" | "exports">("chart");
 
   /* ── Saved analyses ── */
   const [savedAnalyses, setSavedAnalyses] = useState<SavedAnalysis[]>(() => {
@@ -846,6 +1007,12 @@ export default function TrendPulse() {
     [chartData, cutoffDate]
   );
 
+  /* PCA — only computed when 2+ keywords are fetched */
+  const pcaResult = useMemo(
+    () => (keywords.length >= 2 ? computePCA(keywords, dataByKeyword) : null),
+    [keywords, dataByKeyword]
+  );
+
   /* Quick stat summary */
   const stats = useMemo(() => {
     if (!fullStats) return null;
@@ -906,7 +1073,36 @@ export default function TrendPulse() {
     for (const [kw, rows] of Object.entries(dataByKeyword)) {
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.map(toRow)), kw.slice(0, 31));
     }
+    /* PCA sheets */
+    if (pcaResult) {
+      const scoreRows = pcaResult.scores.map((s, i) => {
+        const row: Record<string, number | string> = { datetime: String(chartData[i]?.datetime ?? i) };
+        s.forEach((v, j) => { row[`PC${j + 1}`] = +v.toFixed(4); });
+        return row;
+      });
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(scoreRows), "PCA Scores");
+      const loadingRows = pcaResult.loadings.map((vec, pcIdx) => {
+        const row: Record<string, number | string> = {
+          PC: `PC${pcIdx + 1}`,
+          eigenvalue: +pcaResult.eigenvalues[pcIdx].toFixed(4),
+          pct_variance: +(pcaResult.explainedVar[pcIdx] * 100).toFixed(2),
+          cumulative_pct: +(pcaResult.cumulativeVar[pcIdx] * 100).toFixed(2),
+        };
+        pcaResult.labels.forEach((kw, j) => { row[kw] = +vec[j].toFixed(4); });
+        return row;
+      });
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(loadingRows), "PCA Loadings");
+    }
     XLSX.writeFile(wb, `${fileBase(keywords)}_trends.xlsx`);
+  };
+
+  const exportPCAcsv = () => {
+    if (!pcaResult) return;
+    const header = ["datetime", ...Array.from({ length: pcaResult.nVars }, (_, i) => `PC${i + 1}`)].join(",");
+    const rows = pcaResult.scores.map((s, i) =>
+      [chartData[i]?.datetime ?? i, ...s.map((v) => v.toFixed(4))].join(",")
+    );
+    saveAs(new Blob([header + "\n" + rows.join("\n")], { type: "text/csv;charset=utf-8" }), `${fileBase(keywords)}_pca_scores.csv`);
   };
 
   const exportRScript = () => {
@@ -929,6 +1125,7 @@ export default function TrendPulse() {
       freq, geo, flatData, cutoffDate, kwStats, fullStats,
       beforeStats: cutoffStats?.before ?? null,
       afterStats: cutoffStats?.after ?? null,
+      pcaResult: pcaResult ?? null,
     });
     saveAs(blob, `${fileBase(keywords)}_trends_report.docx`);
   };
@@ -1429,10 +1626,11 @@ export default function TrendPulse() {
             {/* Tabs */}
             <div className="flex items-center gap-1 border-b border-[var(--border)]">
               {([
-                { key: "chart", label: "Chart", icon: "📈" },
-                { key: "table", label: "Data Table", icon: "📊" },
-                { key: "exports", label: "Exports", icon: "📦" },
-              ] as const).map((tab) => (
+                { key: "chart" as const, label: "Chart", icon: "📈" },
+                { key: "table" as const, label: "Data Table", icon: "📊" },
+                ...(keywords.length >= 2 ? [{ key: "pca" as const, label: "PCA", icon: "🔬" }] : []),
+                { key: "exports" as const, label: "Exports", icon: "📦" },
+              ]).map((tab) => (
                 <button key={tab.key} onClick={() => setActiveTab(tab.key)}
                   className={`px-5 py-3 text-sm font-medium tracking-wide transition-colors border-b-2 -mb-px ${activeTab === tab.key ? "border-[var(--accent)] text-[var(--accent)]" : "border-transparent text-[var(--text-muted)] hover:text-[var(--text-secondary)]"}`}>
                   {tab.icon} {tab.label}
@@ -1584,6 +1782,204 @@ export default function TrendPulse() {
               </div>
             )}
 
+            {/* PCA tab */}
+            {activeTab === "pca" && pcaResult && (
+              <div className="animate-fade-in-up space-y-6" style={{ animationDelay: "80ms" }}>
+
+                {/* Summary cards */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  {[
+                    { label: "Keywords (vars)", value: pcaResult.nVars },
+                    { label: "Observations", value: pcaResult.nObs.toLocaleString() },
+                    { label: "PC1 Variance", value: `${(pcaResult.explainedVar[0] * 100).toFixed(1)}%` },
+                    { label: "PC1+PC2 Cumulative", value: `${(pcaResult.cumulativeVar[Math.min(1, pcaResult.nVars - 1)] * 100).toFixed(1)}%` },
+                  ].map((c, i) => (
+                    <div key={c.label} className="animate-fade-in-up rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-4" style={{ animationDelay: `${i * 50}ms` }}>
+                      <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-1 font-semibold">{c.label}</div>
+                      <div className="text-xl font-bold font-mono text-[var(--text-primary)]">{c.value}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Scree plot */}
+                <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-6">
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="text-[11px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">Scree Plot — Variance Explained per PC</div>
+                    <span className="text-[10px] text-[var(--text-muted)] font-mono">bars = individual · line = cumulative</span>
+                  </div>
+                  <div className="h-[260px]">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <ComposedChart
+                        data={pcaResult.explainedVar.slice(0, Math.min(pcaResult.nVars, 15)).map((v, i) => ({
+                          name: `PC${i + 1}`,
+                          individual: +(v * 100).toFixed(2),
+                          cumulative: +(pcaResult.cumulativeVar[i] * 100).toFixed(2),
+                        }))}
+                        margin={{ top: 5, right: 20, left: 0, bottom: 5 }}
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                        <XAxis dataKey="name" tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} />
+                        <YAxis yAxisId="left" domain={[0, 100]} tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={false} tickLine={false} width={40} />
+                        <YAxis yAxisId="right" orientation="right" domain={[0, 100]} tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={false} tickLine={false} width={35} />
+                        <Tooltip
+                          contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-accent)", borderRadius: 8, fontSize: 12 }}
+                          formatter={(v, name) => [`${Number(v).toFixed(2)}%`, name === "individual" ? "% Variance" : "Cumulative %"]}
+                        />
+                        <Bar yAxisId="left" dataKey="individual" name="individual" radius={[4, 4, 0, 0]}>
+                          {pcaResult.explainedVar.slice(0, 15).map((_, i) => (
+                            <Cell key={i} fill={i < 2 ? "var(--accent)" : i < 5 ? "var(--accent-secondary)" : "var(--border-accent)"} fillOpacity={0.85} />
+                          ))}
+                        </Bar>
+                        <Line yAxisId="right" type="monotone" dataKey="cumulative" name="cumulative" stroke="#ffb347" strokeWidth={2} dot={{ fill: "#ffb347", r: 3, strokeWidth: 0 }} />
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                {/* Loadings table */}
+                <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-6">
+                  <div className="text-[11px] uppercase tracking-widest text-[var(--text-muted)] mb-1 font-semibold">
+                    Component Loadings — Keyword Contributions
+                  </div>
+                  <p className="text-[11px] text-[var(--text-muted)] mb-4">
+                    How strongly each keyword drives each principal component. Large |values| = strong influence. Sign indicates direction.
+                  </p>
+                  <div className="overflow-x-auto">
+                    {(() => {
+                      const showPCs = Math.min(pcaResult.nVars, 8);
+                      return (
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="border-b border-[var(--border)]">
+                              <th className="px-3 py-2 text-left text-[10px] uppercase tracking-widest text-[var(--text-muted)] font-semibold whitespace-nowrap sticky left-0 bg-[var(--bg-card)]">
+                                Keyword
+                              </th>
+                              {Array.from({ length: showPCs }, (_, i) => (
+                                <th key={i} className="px-3 py-2 text-center text-[10px] uppercase tracking-widest text-[var(--text-muted)] font-semibold whitespace-nowrap">
+                                  <div>PC{i + 1}</div>
+                                  <div className="text-[9px] font-normal normal-case tracking-normal" style={{ color: i < 2 ? "var(--accent)" : "var(--text-muted)" }}>
+                                    {(pcaResult.explainedVar[i] * 100).toFixed(1)}%
+                                  </div>
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {pcaResult.labels.map((kw, kwIdx) => {
+                              const color = KW_COLORS[keywords.indexOf(kw) >= 0 ? keywords.indexOf(kw) : kwIdx];
+                              return (
+                                <tr key={kw} className="border-b border-[var(--border)]/40 hover:bg-[var(--bg-card-hover)] transition-colors">
+                                  <td className="px-3 py-2 font-medium sticky left-0 bg-[var(--bg-card)] whitespace-nowrap" style={{ color }}>
+                                    <span className="inline-flex items-center gap-1.5">
+                                      <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: color }} />
+                                      {kw}
+                                    </span>
+                                  </td>
+                                  {Array.from({ length: showPCs }, (_, pcIdx) => {
+                                    const val = pcaResult.loadings[pcIdx][kwIdx];
+                                    const abs = Math.abs(val);
+                                    const bg = val > 0
+                                      ? `rgba(0,229,160,${Math.min(abs * 0.6, 0.4)})`
+                                      : `rgba(255,92,92,${Math.min(abs * 0.6, 0.4)})`;
+                                    return (
+                                      <td key={pcIdx} className="px-3 py-2 text-center font-mono font-bold"
+                                        style={{ background: bg, color: abs > 0.3 ? (val > 0 ? "var(--accent)" : "var(--danger)") : "var(--text-secondary)" }}>
+                                        {val >= 0 ? "+" : ""}{val.toFixed(3)}
+                                      </td>
+                                    );
+                                  })}
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                          <tfoot>
+                            <tr className="border-t-2 border-[var(--border-accent)] bg-[var(--bg-secondary)]">
+                              <td className="px-3 py-2 text-[10px] uppercase tracking-wider text-[var(--text-muted)] font-semibold">Eigenvalue</td>
+                              {Array.from({ length: showPCs }, (_, i) => (
+                                <td key={i} className="px-3 py-2 text-center font-mono text-[11px] text-[var(--text-secondary)]">
+                                  {pcaResult.eigenvalues[i].toFixed(3)}
+                                </td>
+                              ))}
+                            </tr>
+                          </tfoot>
+                        </table>
+                      );
+                    })()}
+                  </div>
+                </div>
+
+                {/* PC1 & PC2 scores over time */}
+                <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-6">
+                  <div className="flex items-center justify-between mb-4">
+                    <div className="text-[11px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">
+                      PC1 & PC2 Scores — Dominant Patterns Over Time
+                    </div>
+                    <span className="text-[10px] text-[var(--text-muted)]">standardized units</span>
+                  </div>
+                  <div className="h-[300px]">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart
+                        data={pcaResult.scores.map((s, i) => ({
+                          datetime: chartData[i]?.datetime ?? String(i),
+                          PC1: +s[0].toFixed(3),
+                          ...(pcaResult.nVars >= 2 ? { PC2: +s[1].toFixed(3) } : {}),
+                          ...(pcaResult.nVars >= 3 ? { PC3: +s[2].toFixed(3) } : {}),
+                        }))}
+                        margin={{ top: 5, right: 20, left: 0, bottom: 5 }}
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                        <XAxis dataKey="datetime" tickFormatter={formatAxisDate} tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} minTickGap={60} />
+                        <YAxis tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={false} tickLine={false} width={40} />
+                        <Tooltip content={<CustomTooltip />} />
+                        <Line type="monotone" dataKey="PC1" stroke="var(--accent)" strokeWidth={1.5} dot={false} activeDot={{ r: 3 }} />
+                        {pcaResult.nVars >= 2 && <Line type="monotone" dataKey="PC2" stroke="var(--accent-secondary)" strokeWidth={1.5} dot={false} activeDot={{ r: 3 }} />}
+                        {pcaResult.nVars >= 3 && <Line type="monotone" dataKey="PC3" stroke="#ffb347" strokeWidth={1} dot={false} activeDot={{ r: 3 }} strokeDasharray="4 2" />}
+                        <Legend wrapperStyle={{ fontSize: 11, paddingTop: 8 }} />
+                        <Brush dataKey="datetime" height={28} stroke="var(--border-accent)" fill="var(--bg-secondary)" tickFormatter={formatAxisDate} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                {/* Variance table */}
+                <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-6">
+                  <div className="text-[11px] uppercase tracking-widest text-[var(--text-muted)] mb-4 font-semibold">
+                    Explained Variance Summary
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-[var(--border)]">
+                          {["PC", "Eigenvalue", "% Variance", "Cumulative %"].map((h) => (
+                            <th key={h} className="px-3 py-2 text-left text-[10px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pcaResult.eigenvalues.map((ev, i) => (
+                          <tr key={i} className="border-b border-[var(--border)]/40 hover:bg-[var(--bg-card-hover)] transition-colors">
+                            <td className="px-3 py-2 font-semibold" style={{ color: i < 2 ? "var(--accent)" : "var(--text-secondary)" }}>PC{i + 1}</td>
+                            <td className="px-3 py-2 font-mono text-[var(--text-secondary)]">{ev.toFixed(4)}</td>
+                            <td className="px-3 py-2">
+                              <div className="flex items-center gap-2">
+                                <div className="flex-1 h-1.5 rounded-full bg-[var(--bg-secondary)] max-w-[100px]">
+                                  <div className="h-full rounded-full" style={{ width: `${(pcaResult.explainedVar[i] * 100).toFixed(1)}%`, background: i < 2 ? "var(--accent)" : "var(--accent-secondary)", opacity: 0.7 }} />
+                                </div>
+                                <span className="font-mono text-[var(--text-secondary)]">{(pcaResult.explainedVar[i] * 100).toFixed(2)}%</span>
+                              </div>
+                            </td>
+                            <td className="px-3 py-2 font-mono" style={{ color: pcaResult.cumulativeVar[i] >= 0.8 ? "var(--accent)" : "var(--text-secondary)" }}>
+                              {(pcaResult.cumulativeVar[i] * 100).toFixed(2)}%
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Exports tab */}
             {activeTab === "exports" && (
               <div className="animate-fade-in-up grid grid-cols-1 md:grid-cols-2 gap-4" style={{ animationDelay: "80ms" }}>
@@ -1593,6 +1989,7 @@ export default function TrendPulse() {
                   { title: "R Script", desc: `gtrendsR loop for all ${keywords.length} keyword${keywords.length > 1 ? "s" : ""} — writes intraday (${freq}) + daily CSVs per keyword plus combined daily.`, icon: "📐", ext: ".R", handler: exportRScript, color: "#2196F3" },
                   { title: "Stata", desc: "CSV + .do file with tsset, moving averages, and plots (first keyword).", icon: "📈", ext: ".do + .csv", handler: exportStata, color: "#FF9800" },
                   { title: "Word Report", desc: `Full .docx report: ${keywords.length} keyword${keywords.length > 1 ? "s" : ""}, collection process, timeline, per-keyword stats (mean, median, variance, skewness, kurtosis), and cutoff comparison if set.`, icon: "📝", ext: ".docx", handler: exportDocx, color: "#2B579A" },
+                  ...(pcaResult ? [{ title: "PCA Scores", desc: `PC scores time series — ${pcaResult.nVars} components × ${pcaResult.nObs.toLocaleString()} observations. PC1 explains ${(pcaResult.explainedVar[0] * 100).toFixed(1)}% of variance.`, icon: "🔬", ext: ".csv", handler: exportPCAcsv, color: "var(--accent-secondary)" }] : []),
                 ].map((exp) => (
                   <button key={exp.title} onClick={exp.handler}
                     className="group text-left rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-6 hover:border-[var(--border-accent)] hover:bg-[var(--bg-card-hover)] transition-all active:scale-[0.98]">
