@@ -450,8 +450,9 @@ async function generateDocxReport(params: {
   beforeStats: FullStats | null;
   afterStats: FullStats | null;
   pcaResult: PCAResult | null;
+  gtSentiment: GTSentimentData | null;
 }): Promise<Blob> {
-  const { keywords, startDate, endDate, freq, geo, flatData, cutoffDate, kwStats, fullStats, beforeStats, afterStats, pcaResult } = params;
+  const { keywords, startDate, endDate, freq, geo, flatData, cutoffDate, kwStats, fullStats, beforeStats, afterStats, pcaResult, gtSentiment } = params;
   const country = COUNTRIES[geo] || "Worldwide";
   const now = new Date().toLocaleString();
 
@@ -577,9 +578,45 @@ async function generateDocxReport(params: {
     );
   }
 
+  /* GT Sentiment section */
+  if (gtSentiment && pcaResult) {
+    const gtSection = cutoffDate ? "6" : "5";
+    children.push(
+      divider(),
+      h(`${gtSection}. Google Trends Sentiment Index (GT-Sentiment)`, HeadingLevel.HEADING_1),
+      p(
+        `The Google Trends Sentiment Index (GT-Sentiment) is derived from the first principal ` +
+        `component (PC1) of the ${pcaResult.nVars} keyword time series. PC1 captures ` +
+        `${(pcaResult.explainedVar[0] * 100).toFixed(1)}% of total variance in the dataset. ` +
+        `The raw PC1 scores are min-max normalized to a scale of 0 to 100, where values ` +
+        `≥ 50 indicate positive sentiment and values < 50 indicate negative sentiment.`
+      ),
+      p(
+        `Normalization formula: GT-Sent_t = 100 × (PC1_t − min(PC1)) / (max(PC1) − min(PC1))`
+      ),
+      new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        rows: [
+          ["Metric", "Value"],
+          ["Mean GT-Sentiment", gtSentiment.mean.toFixed(2)],
+          ["Latest Value", gtSentiment.latest.toFixed(2)],
+          ["% Time Positive (≥ 50)", `${gtSentiment.pctPositive.toFixed(1)}%`],
+          ["% Time Negative (< 50)", `${(100 - gtSentiment.pctPositive).toFixed(1)}%`],
+          ["Peak (max)", gtSentiment.max.toFixed(2)],
+          ["Trough (min)", gtSentiment.min.toFixed(2)],
+          ["Observations", gtSentiment.values.length.toLocaleString()],
+          ["PC1 Variance Explained", `${(pcaResult.explainedVar[0] * 100).toFixed(2)}%`],
+          ["Overall Signal", gtSentiment.mean >= 50 ? "Positive" : "Negative"],
+        ].map(([label, val]) =>
+          new TableRow({ children: [docCell(label, true, "e8f5ee"), docCell(val, false, "ffffff")] })
+        ),
+      }),
+    );
+  }
+
   /* PCA section */
   if (pcaResult) {
-    const pcaSection = cutoffDate ? "6" : "5";
+    const pcaSection = cutoffDate ? (gtSentiment ? "7" : "6") : (gtSentiment ? "6" : "5");
     const showPCs = Math.min(pcaResult.nVars, 8);
     children.push(
       divider(),
@@ -625,7 +662,13 @@ async function generateDocxReport(params: {
     );
   }
 
-  const varSection = cutoffDate ? (pcaResult ? "7" : "6") : (pcaResult ? "6" : "5");
+  const varSection = (() => {
+    let n = 5;
+    if (cutoffDate) n++;
+    if (pcaResult) n++;
+    if (gtSentiment && pcaResult) n++;
+    return String(n);
+  })();
   children.push(
     divider(),
     h(`${varSection}. Notes on Variance Extraction`, HeadingLevel.HEADING_1),
@@ -657,6 +700,18 @@ async function generateDocxReport(params: {
     sections: [{ children }],
   });
   return await Packer.toBlob(doc);
+}
+
+/* ─────────── GT Sentiment Types ─────────── */
+interface GTSentimentData {
+  chartRows: { datetime: string; sentiment: number }[];
+  values: number[];
+  mean: number;
+  pctPositive: number;  // % of observations ≥ 50
+  latest: number;
+  min: number;
+  max: number;
+  pc1Raw: number[];     // un-normalized PC1 scores
 }
 
 /* ─────────── PCA Computation ─────────── */
@@ -1013,6 +1068,31 @@ export default function TrendPulse() {
     [keywords, dataByKeyword]
   );
 
+  /* GT Sentiment — PC1 scores normalized to [0, 100] */
+  const gtSentiment = useMemo((): GTSentimentData | null => {
+    if (!pcaResult || !chartData.length) return null;
+    const pc1Raw = pcaResult.scores.map((s) => s[0]);
+    const minV = Math.min(...pc1Raw);
+    const maxV = Math.max(...pc1Raw);
+    const range = maxV - minV || 1;
+    const values = pc1Raw.map((v) => +(((v - minV) / range) * 100).toFixed(2));
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const pctPositive = (values.filter((v) => v >= 50).length / values.length) * 100;
+    return {
+      chartRows: values.map((v, i) => ({
+        datetime: String(chartData[i]?.datetime ?? i),
+        sentiment: v,
+      })),
+      values,
+      mean,
+      pctPositive,
+      latest: values[values.length - 1],
+      min: Math.min(...values),
+      max: Math.max(...values),
+      pc1Raw,
+    };
+  }, [pcaResult, chartData]);
+
   /* Quick stat summary */
   const stats = useMemo(() => {
     if (!fullStats) return null;
@@ -1062,6 +1142,15 @@ export default function TrendPulse() {
     saveAs(new Blob([header + rows], { type: "text/csv;charset=utf-8" }), `${fileBase(keywords)}_trends.csv`);
   };
 
+  const exportGTSentimentCSV = () => {
+    if (!gtSentiment) return;
+    const header = "datetime,gt_sentiment,pc1_raw\n";
+    const rows = gtSentiment.chartRows.map((row, i) =>
+      `${row.datetime},${row.sentiment.toFixed(2)},${gtSentiment.pc1Raw[i].toFixed(4)}`
+    ).join("\n");
+    saveAs(new Blob([header + rows], { type: "text/csv;charset=utf-8" }), `${fileBase(keywords)}_gt_sentiment.csv`);
+  };
+
   const exportExcel = () => {
     const wb = XLSX.utils.book_new();
     const toRow = (r: TrendRow) => ({
@@ -1072,6 +1161,16 @@ export default function TrendPulse() {
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(flatData.map(toRow)), "Combined");
     for (const [kw, rows] of Object.entries(dataByKeyword)) {
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.map(toRow)), kw.slice(0, 31));
+    }
+    /* GT Sentiment sheet */
+    if (gtSentiment) {
+      const sentRows = gtSentiment.chartRows.map((row, i) => ({
+        datetime: row.datetime,
+        gt_sentiment: row.sentiment,
+        pc1_raw: +gtSentiment.pc1Raw[i].toFixed(4),
+        signal: row.sentiment >= 50 ? "Positive" : "Negative",
+      }));
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(sentRows), "GT Sentiment");
     }
     /* PCA sheets */
     if (pcaResult) {
@@ -1126,6 +1225,7 @@ export default function TrendPulse() {
       beforeStats: cutoffStats?.before ?? null,
       afterStats: cutoffStats?.after ?? null,
       pcaResult: pcaResult ?? null,
+      gtSentiment: gtSentiment ?? null,
     });
     saveAs(blob, `${fileBase(keywords)}_trends_report.docx`);
   };
@@ -1786,6 +1886,95 @@ export default function TrendPulse() {
             {activeTab === "pca" && pcaResult && (
               <div className="animate-fade-in-up space-y-6" style={{ animationDelay: "80ms" }}>
 
+                {/* ── GT Sentiment Index ── */}
+                {gtSentiment && (
+                  <div className="rounded-2xl border bg-[var(--bg-card)] p-6" style={{ borderColor: gtSentiment.mean >= 50 ? "rgba(0,229,160,0.35)" : "rgba(255,92,92,0.35)" }}>
+                    {/* Header */}
+                    <div className="flex items-start justify-between mb-4">
+                      <div>
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-[11px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">
+                            Google Trends Sentiment Index
+                          </span>
+                          <span className="text-[10px] px-2 py-0.5 rounded-full font-mono border border-[var(--accent)]/30 bg-[var(--accent)]/10 text-[var(--accent)]">GT-Sent</span>
+                        </div>
+                        <p className="text-xs text-[var(--text-muted)]">
+                          PC1 of {pcaResult.nVars} keyword{pcaResult.nVars > 1 ? "s" : ""} — min-max normalized to 0–100 ·
+                          <span style={{ color: "var(--accent)" }}> ≥ 50 = positive sentiment</span> ·
+                          <span style={{ color: "var(--danger)" }}> &lt; 50 = negative sentiment</span>
+                        </p>
+                      </div>
+                      <div className="text-right flex-shrink-0">
+                        <div className="text-3xl font-bold font-mono" style={{ color: gtSentiment.latest >= 50 ? "var(--accent)" : "var(--danger)" }}>
+                          {gtSentiment.latest.toFixed(1)}
+                        </div>
+                        <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-wider">latest</div>
+                        <div className="text-xs font-semibold mt-0.5" style={{ color: gtSentiment.latest >= 50 ? "var(--accent)" : "var(--danger)" }}>
+                          {gtSentiment.latest >= 50 ? "▲ Positive" : "▼ Negative"}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Stat chips */}
+                    <div className="flex flex-wrap gap-2 mb-5">
+                      {[
+                        { label: "Mean", value: gtSentiment.mean.toFixed(1), color: gtSentiment.mean >= 50 ? "var(--accent)" : "var(--danger)" },
+                        { label: "Positive %", value: `${gtSentiment.pctPositive.toFixed(1)}%`, color: "var(--accent)" },
+                        { label: "Negative %", value: `${(100 - gtSentiment.pctPositive).toFixed(1)}%`, color: "var(--danger)" },
+                        { label: "Peak", value: gtSentiment.max.toFixed(1), color: "var(--text-secondary)" },
+                        { label: "Trough", value: gtSentiment.min.toFixed(1), color: "var(--text-secondary)" },
+                        { label: "N obs", value: gtSentiment.values.length.toLocaleString(), color: "var(--text-secondary)" },
+                      ].map((c) => (
+                        <div key={c.label} className="text-center py-2 px-4 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)]">
+                          <div className="text-[10px] uppercase tracking-wider text-[var(--text-muted)] mb-0.5">{c.label}</div>
+                          <div className="font-mono font-bold text-sm" style={{ color: c.color }}>{c.value}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Chart */}
+                    <div className="h-[300px]">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <AreaChart data={gtSentiment.chartRows} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+                          <defs>
+                            <linearGradient id="sentimentGrad" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="0%" stopColor="#00e5a0" stopOpacity={0.55} />
+                              <stop offset="50%" stopColor="#ffb347" stopOpacity={0.12} />
+                              <stop offset="100%" stopColor="#ff5c5c" stopOpacity={0.55} />
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                          <XAxis dataKey="datetime" tickFormatter={formatAxisDate} tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} minTickGap={60} />
+                          <YAxis domain={[0, 100]} tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={false} tickLine={false} width={35} />
+                          <Tooltip content={<CustomTooltip />} />
+                          <ReferenceLine y={50} stroke="#ffb347" strokeDasharray="6 3" strokeWidth={1.5}
+                            label={{ value: "Neutral  50", position: "insideTopRight", fill: "#ffb347", fontSize: 10, fontFamily: "monospace" }} />
+                          <Area type="monotone" dataKey="sentiment" name="GT-Sentiment"
+                            stroke="var(--accent)" strokeWidth={1.5}
+                            fill="url(#sentimentGrad)"
+                            dot={false}
+                            activeDot={{ r: 4, fill: "var(--accent)", stroke: "var(--bg-primary)", strokeWidth: 2 }} />
+                          <Brush dataKey="datetime" height={28} stroke="var(--border-accent)" fill="var(--bg-secondary)" tickFormatter={formatAxisDate} />
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </div>
+
+                    {/* Positive / Negative bar */}
+                    <div className="mt-4 flex items-center gap-3">
+                      <span className="text-[10px] uppercase tracking-wider text-[var(--danger)] font-medium w-20">Negative</span>
+                      <div className="flex-1 h-2.5 rounded-full overflow-hidden flex">
+                        <div className="h-full rounded-l-full" style={{ width: `${100 - gtSentiment.pctPositive}%`, background: "var(--danger)", opacity: 0.7 }} />
+                        <div className="h-full rounded-r-full" style={{ width: `${gtSentiment.pctPositive}%`, background: "var(--accent)", opacity: 0.7 }} />
+                      </div>
+                      <span className="text-[10px] uppercase tracking-wider text-[var(--accent)] font-medium w-20 text-right">Positive</span>
+                    </div>
+                    <div className="flex justify-between text-[10px] font-mono text-[var(--text-muted)] mt-1 px-20">
+                      <span>{(100 - gtSentiment.pctPositive).toFixed(1)}%</span>
+                      <span>{gtSentiment.pctPositive.toFixed(1)}%</span>
+                    </div>
+                  </div>
+                )}
+
                 {/* Summary cards */}
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                   {[
@@ -1990,6 +2179,7 @@ export default function TrendPulse() {
                   { title: "Stata", desc: "CSV + .do file with tsset, moving averages, and plots (first keyword).", icon: "📈", ext: ".do + .csv", handler: exportStata, color: "#FF9800" },
                   { title: "Word Report", desc: `Full .docx report: ${keywords.length} keyword${keywords.length > 1 ? "s" : ""}, collection process, timeline, per-keyword stats (mean, median, variance, skewness, kurtosis), and cutoff comparison if set.`, icon: "📝", ext: ".docx", handler: exportDocx, color: "#2B579A" },
                   ...(pcaResult ? [{ title: "PCA Scores", desc: `PC scores time series — ${pcaResult.nVars} components × ${pcaResult.nObs.toLocaleString()} observations. PC1 explains ${(pcaResult.explainedVar[0] * 100).toFixed(1)}% of variance.`, icon: "🔬", ext: ".csv", handler: exportPCAcsv, color: "var(--accent-secondary)" }] : []),
+                  ...(gtSentiment ? [{ title: "GT Sentiment", desc: `Google Trends Sentiment Index — PC1 normalized 0–100. Mean: ${gtSentiment.mean.toFixed(1)} · Positive: ${gtSentiment.pctPositive.toFixed(1)}% · Negative: ${(100 - gtSentiment.pctPositive).toFixed(1)}%.`, icon: "📡", ext: ".csv", handler: exportGTSentimentCSV, color: "var(--accent)" }] : []),
                 ].map((exp) => (
                   <button key={exp.title} onClick={exp.handler}
                     className="group text-left rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-6 hover:border-[var(--border-accent)] hover:bg-[var(--bg-card-hover)] transition-all active:scale-[0.98]">
