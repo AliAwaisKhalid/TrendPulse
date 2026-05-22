@@ -133,13 +133,15 @@ function effectiveRange(
   mode: DateMode, days: number, startDate: string, endDate: string
 ): { start: Date; end: Date } {
   if (mode === "range" && startDate && endDate) {
-    let s = new Date(`${startDate}T00:00:00`);
-    let e = new Date(`${endDate}T23:59:59`);
+    let s = new Date(`${startDate}T00:00:00Z`);
+    let e = new Date(`${endDate}T23:59:59Z`);
     if (s.getTime() > e.getTime()) [s, e] = [e, s];
     return { start: s, end: e };
   }
-  const end = new Date();
-  const start = new Date(end.getTime() - days * 86400000);
+  // UTC-based "now" so relative range is timezone-agnostic
+  const nowMs = Date.now();
+  const end = new Date(nowMs);
+  const start = new Date(nowMs - days * 86400000);
   return { start, end };
 }
 
@@ -174,8 +176,9 @@ function generateSimulatedData(
 
   for (let i = 0; i < totalSteps; i++) {
     const dt = new Date(start.getTime() + i * stepMs);
-    const hour = dt.getHours();
-    const dow = dt.getDay();
+    // All datetime components use UTC so data is timezone-agnostic
+    const hour = dt.getUTCHours();
+    const dow = dt.getUTCDay();
     const dailyCycle = hour >= 9 && hour <= 23 ? 15 * Math.sin(((hour - 9) / 14) * Math.PI) : -10;
     const weekCycle = dow === 0 || dow === 6 ? -8 : 3;
     const trend = trendSlope * i;
@@ -184,15 +187,15 @@ function generateSimulatedData(
     let hits = Math.round(base + dailyCycle + weekCycle + trend + noise + spikes);
     hits = Math.max(0, Math.min(100, hits));
     const dateStr = dt.toISOString().slice(0, 10);
-    const timeStr = `${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`;
+    const timeStr = `${String(dt.getUTCHours()).padStart(2, "0")}:${String(dt.getUTCMinutes()).padStart(2, "0")}`;
     rows.push({
       keyword,
       datetime: `${dateStr} ${timeStr}`,
       date: dateStr, time: timeStr,
-      year: dt.getFullYear(), month: dt.getMonth() + 1, day: dt.getDate(),
-      hour: dt.getHours(), minute: dt.getMinutes(),
+      year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate(),
+      hour: dt.getUTCHours(), minute: dt.getUTCMinutes(),
       dow, dowName: DOW_NAMES[dow],
-      quarter: Math.floor(dt.getMonth() / 3) + 1,
+      quarter: Math.floor(dt.getUTCMonth() / 3) + 1,
       weekend: dow === 0 || dow === 6,
       hits,
     });
@@ -879,6 +882,8 @@ export default function TrendPulse() {
   const [dataByKeyword, setDataByKeyword] = useState<Record<string, TrendRow[]>>({});
   const [loading, setLoading] = useState(false);
   const [fetched, setFetched] = useState(false);
+  const [dataSource, setDataSource] = useState<"real" | "simulated" | "mixed" | null>(null);
+  const [fetchProgress, setFetchProgress] = useState<string>("");
 
   /* ── Analysis state ── */
   const [cutoffDate, setCutoffDate] = useState("");
@@ -920,22 +925,61 @@ export default function TrendPulse() {
   }, []);
 
   /* ── Fetch ── */
-  const handleFetch = useCallback(() => {
+  const handleFetch = useCallback(async () => {
     if (!keywords.length) return;
     setLoading(true);
     setFetched(false);
-    setTimeout(() => {
-      const { start, end } = effectiveRange(dateMode, days, startDate, endDate);
-      const newData: Record<string, TrendRow[]> = {};
-      for (const kw of keywords) {
+    setDataSource(null);
+    setFetchProgress("");
+
+    const { start, end } = effectiveRange(dateMode, days, startDate, endDate);
+    const startISO = toISODate(start);
+    const endISO = toISODate(end);
+    const newData: Record<string, TrendRow[]> = {};
+    let realCount = 0;
+    let simCount = 0;
+
+    for (let i = 0; i < keywords.length; i++) {
+      const kw = keywords[i];
+      setFetchProgress(`Fetching "${kw}" (${i + 1}/${keywords.length})…`);
+      try {
+        const params = new URLSearchParams({ keyword: kw, startDate: startISO, endDate: endISO });
+        if (geo) params.set("geo", geo);
+        const res = await fetch(`/api/trends?${params}`);
+        if (res.ok) {
+          const json = await res.json();
+          if (Array.isArray(json.data) && json.data.length > 0) {
+            // Attach keyword field (API route doesn't include it in rows)
+            newData[kw] = (json.data as Omit<TrendRow, "keyword">[]).map((row) => ({ ...row, keyword: kw }));
+            realCount++;
+          } else {
+            throw new Error("empty");
+          }
+        } else {
+          throw new Error(`HTTP ${res.status}`);
+        }
+      } catch {
+        // Fallback: generate simulated data for this keyword
         newData[kw] = generateSimulatedData(kw, start, end, freq, geo);
+        simCount++;
       }
-      setDataByKeyword(newData);
-      setLoading(false);
-      setFetched(true);
-      setPage(0);
-      setActiveTab("chart");
-    }, 1000 + keywords.length * 150);
+      // Rate-limit: pause 800 ms between keywords to avoid hitting Google's limit
+      if (i < keywords.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
+    }
+
+    const source: "real" | "simulated" | "mixed" =
+      realCount > 0 && simCount === 0 ? "real" :
+      simCount > 0 && realCount === 0 ? "simulated" : "mixed";
+
+    setDataByKeyword(newData);
+    setDataSource(source);
+    setFetchProgress("");
+    setLoading(false);
+    setFetched(true);
+    setPage(0);
+    setActiveTab("chart");
   }, [keywords, days, dateMode, startDate, endDate, freq, geo]);
 
   /* ── Save / Load / Delete analyses ── */
@@ -1269,8 +1313,27 @@ export default function TrendPulse() {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <Badge variant="accent">v3.0</Badge>
-            <Badge variant="muted">gtrendsR</Badge>
+            <Badge variant="muted">UTC</Badge>
+            {dataSource === "real" && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide uppercase rounded-full border bg-emerald-500/15 text-emerald-400 border-emerald-500/30">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                Live Data
+              </span>
+            )}
+            {dataSource === "simulated" && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide uppercase rounded-full border bg-amber-500/15 text-amber-400 border-amber-500/30">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                Simulated
+              </span>
+            )}
+            {dataSource === "mixed" && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide uppercase rounded-full border bg-blue-500/15 text-blue-400 border-blue-500/30">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
+                Mixed
+              </span>
+            )}
+            <Badge variant="accent">v3.1</Badge>
+            <Badge variant="muted">Google Trends</Badge>
           </div>
         </div>
       </header>
@@ -1486,7 +1549,7 @@ export default function TrendPulse() {
                     <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" className="opacity-25" />
                     <path d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" fill="currentColor" className="opacity-75" />
                   </svg>
-                  Fetching {keywords.length} keyword{keywords.length > 1 ? "s" : ""}…
+                  {fetchProgress || `Fetching ${keywords.length} keyword${keywords.length > 1 ? "s" : ""}…`}
                 </span>
               ) : (
                 `Fetch Trends${keywords.length > 0 ? ` (${keywords.length} keyword${keywords.length > 1 ? "s" : ""})` : ""}`
@@ -1642,6 +1705,27 @@ export default function TrendPulse() {
               <StatCard label="Low" value={stats!.min} sub="minimum observed" delay={180} />
               <StatCard label="Region" value={geo || "🌍"} sub={COUNTRIES[geo] || "Worldwide"} delay={240} />
             </div>
+
+            {/* Data source info bar */}
+            {dataSource && (
+              <div className={`flex items-center gap-3 px-4 py-2.5 rounded-xl border text-xs font-medium ${
+                dataSource === "real"
+                  ? "bg-emerald-500/10 border-emerald-500/25 text-emerald-400"
+                  : dataSource === "simulated"
+                  ? "bg-amber-500/10 border-amber-500/25 text-amber-400"
+                  : "bg-blue-500/10 border-blue-500/25 text-blue-400"
+              }`}>
+                <span className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                  dataSource === "real" ? "bg-emerald-400 animate-pulse" :
+                  dataSource === "simulated" ? "bg-amber-400" : "bg-blue-400"
+                }`} />
+                <span>
+                  {dataSource === "real" && "✓ Live Google Trends data · All timestamps in UTC"}
+                  {dataSource === "simulated" && "⚠ Simulated data (Google Trends unavailable) · All timestamps in UTC"}
+                  {dataSource === "mixed" && "⚡ Mixed: some keywords use live data, others use simulated fallback · All timestamps in UTC"}
+                </span>
+              </div>
+            )}
 
             {/* Descriptive stats panel */}
             <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5">
