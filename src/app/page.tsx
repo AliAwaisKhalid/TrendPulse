@@ -381,6 +381,22 @@ function computeStats(hits: number[]): FullStats | null {
   return { n, mean, median, variance, stdDev, skewness, kurtosis, min: sorted[0], max: sorted[n - 1] };
 }
 
+/* ─────────── Saved Analyses ─────────── */
+interface SavedAnalysis {
+  id: string;
+  name: string;
+  savedAt: string;
+  keywords: string[];
+  freq: Frequency;
+  geo: string;
+  dateMode: DateMode;
+  days: number;
+  startDate: string;
+  endDate: string;
+  cutoffDate: string;
+  dataByKeyword: Record<string, TrendRow[]>;
+}
+
 /* ─────────── DOCX Report ─────────── */
 function docCell(text: string, bold = false, bg?: string): TableCell {
   return new TableCell({
@@ -651,6 +667,16 @@ export default function TrendPulse() {
   /* ── Tab state ── */
   const [activeTab, setActiveTab] = useState<"chart" | "table" | "exports">("chart");
 
+  /* ── Saved analyses ── */
+  const [savedAnalyses, setSavedAnalyses] = useState<SavedAnalysis[]>(() => {
+    if (typeof window === "undefined") return [];
+    try { return JSON.parse(localStorage.getItem("trendpulse_saves") ?? "[]"); }
+    catch { return []; }
+  });
+  const [saveNameInput, setSaveNameInput] = useState("");
+  const [showSaveInput, setShowSaveInput] = useState(false);
+  const [showSaved, setShowSaved] = useState(true);
+
   /* ── Keyword management ── */
   const addKeyword = useCallback((raw: string) => {
     const kw = raw.trim().replace(/,$/, "");
@@ -681,6 +707,61 @@ export default function TrendPulse() {
       setActiveTab("chart");
     }, 1000 + keywords.length * 150);
   }, [keywords, days, dateMode, startDate, endDate, freq, geo]);
+
+  /* ── Save / Load / Delete analyses ── */
+  const handleSave = useCallback(() => {
+    const name = saveNameInput.trim() || keywords.slice(0, 3).join(", ").slice(0, 50);
+    if (!name || !fetched) return;
+    const entry: SavedAnalysis = {
+      id: Date.now().toString(), name, savedAt: new Date().toISOString(),
+      keywords, freq, geo, dateMode, days, startDate, endDate, cutoffDate, dataByKeyword,
+    };
+    setSavedAnalyses((prev) => {
+      const next = [entry, ...prev].slice(0, 15);
+      try {
+        localStorage.setItem("trendpulse_saves", JSON.stringify(next));
+        return next;
+      } catch {
+        /* Storage full — save config only (no raw data) */
+        const lite = next.map((s) => ({ ...s, dataByKeyword: {} }));
+        try { localStorage.setItem("trendpulse_saves", JSON.stringify(lite)); return lite; }
+        catch { return prev; }
+      }
+    });
+    setSaveNameInput("");
+    setShowSaveInput(false);
+  }, [saveNameInput, keywords, fetched, freq, geo, dateMode, days, startDate, endDate, cutoffDate, dataByKeyword]);
+
+  const handleLoadAnalysis = useCallback((saved: SavedAnalysis) => {
+    setKeywords(saved.keywords);
+    setFreq(saved.freq); setGeo(saved.geo);
+    setDateMode(saved.dateMode); setDays(saved.days);
+    setStartDate(saved.startDate); setEndDate(saved.endDate);
+    setCutoffDate(saved.cutoffDate);
+    const hasData = Object.keys(saved.dataByKeyword).length > 0;
+    if (hasData) {
+      setDataByKeyword(saved.dataByKeyword);
+      setFetched(true); setPage(0); setActiveTab("chart");
+    } else {
+      /* Config-only save — regenerate data using saved params */
+      setDataByKeyword({}); setFetched(false);
+      setLoading(true);
+      setTimeout(() => {
+        const { start, end } = effectiveRange(saved.dateMode, saved.days, saved.startDate, saved.endDate);
+        const newData: Record<string, TrendRow[]> = {};
+        for (const kw of saved.keywords) newData[kw] = generateSimulatedData(kw, start, end, saved.freq, saved.geo);
+        setDataByKeyword(newData); setLoading(false); setFetched(true); setPage(0); setActiveTab("chart");
+      }, 1000 + saved.keywords.length * 150);
+    }
+  }, []);
+
+  const handleDeleteAnalysis = useCallback((id: string) => {
+    setSavedAnalyses((prev) => {
+      const next = prev.filter((s) => s.id !== id);
+      try { localStorage.setItem("trendpulse_saves", JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
 
   /* ── Derived data ── */
   const flatData = useMemo(
@@ -1012,6 +1093,47 @@ export default function TrendPulse() {
             </button>
           </div>
 
+          {/* Save / Saved toggle row */}
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            {fetched && !showSaveInput && (
+              <button
+                onClick={() => { setSaveNameInput(keywords.slice(0, 3).join(", ").slice(0, 50)); setShowSaveInput(true); }}
+                className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold border border-[var(--border)] text-[var(--text-secondary)] hover:border-[var(--accent)]/50 hover:text-[var(--accent)] transition-colors"
+              >
+                💾 Save Analysis
+              </button>
+            )}
+            {showSaveInput && (
+              <div className="flex items-center gap-2 flex-1">
+                <input
+                  type="text"
+                  value={saveNameInput}
+                  onChange={(e) => setSaveNameInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleSave(); if (e.key === "Escape") setShowSaveInput(false); }}
+                  placeholder="Analysis name…"
+                  autoFocus
+                  className="flex-1 px-3 py-2 rounded-lg bg-[var(--bg-secondary)] border border-[var(--accent)]/50 text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)] transition-colors text-sm"
+                />
+                <button onClick={handleSave}
+                  className="px-4 py-2 rounded-lg bg-[var(--accent)] text-[var(--bg-primary)] text-sm font-semibold hover:bg-[var(--accent-dim)] transition-colors whitespace-nowrap">
+                  Save
+                </button>
+                <button onClick={() => setShowSaveInput(false)}
+                  className="px-3 py-2 rounded-lg border border-[var(--border)] text-[var(--text-muted)] text-sm hover:text-[var(--danger)] hover:border-[var(--danger)]/40 transition-colors">
+                  ✕
+                </button>
+              </div>
+            )}
+            {savedAnalyses.length > 0 && (
+              <button
+                onClick={() => setShowSaved((v) => !v)}
+                className={`ml-auto flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-colors border ${showSaved ? "border-[var(--accent)]/40 text-[var(--accent)] bg-[var(--accent)]/10" : "border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-secondary)]"}`}
+              >
+                📂 Saved ({savedAnalyses.length}) {showSaved ? "▲" : "▼"}
+              </button>
+            )}
+          </div>
+
           {/* Cutoff date */}
           <div className="mt-4 pt-4 border-t border-[var(--border)] flex flex-wrap items-center gap-4">
             <div className="flex items-center gap-3">
@@ -1048,6 +1170,57 @@ export default function TrendPulse() {
             <span className="ml-auto">Simulated data • R script exports {freq} + daily CSVs per keyword</span>
           </div>
         </section>
+
+        {/* Saved Analyses Panel */}
+        {savedAnalyses.length > 0 && showSaved && (
+          <section className="animate-fade-in-up rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5" style={{ animationDelay: "150ms" }}>
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">📂 Saved Analyses</span>
+                <span className="text-[10px] text-[var(--text-muted)] normal-case tracking-normal">· click to restore</span>
+              </div>
+              <button onClick={() => setShowSaved(false)} className="text-[var(--text-muted)] hover:text-[var(--text-secondary)] text-xs transition-colors">Hide ✕</button>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {savedAnalyses.map((saved) => (
+                <div key={saved.id} className="rounded-xl border border-[var(--border)] bg-[var(--bg-secondary)] p-4 hover:border-[var(--border-accent)] transition-all group flex flex-col gap-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="font-semibold text-sm text-[var(--text-primary)] truncate leading-snug">{saved.name}</span>
+                    <button
+                      onClick={() => handleDeleteAnalysis(saved.id)}
+                      className="flex-shrink-0 text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors leading-none opacity-0 group-hover:opacity-100"
+                      title="Delete save"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {saved.keywords.slice(0, 4).map((kw, i) => (
+                      <span key={kw} className="text-[10px] px-2 py-0.5 rounded-full font-medium"
+                        style={{ background: KW_COLORS[i] + "22", color: KW_COLORS[i], border: `1px solid ${KW_COLORS[i]}44` }}>
+                        {kw}
+                      </span>
+                    ))}
+                    {saved.keywords.length > 4 && (
+                      <span className="text-[10px] px-2 py-0.5 rounded-full text-[var(--text-muted)] border border-[var(--border)]">
+                        +{saved.keywords.length - 4}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-[var(--text-muted)] font-mono">
+                    {saved.freq} · {(COUNTRIES[saved.geo] ?? saved.geo) || "Worldwide"} · {new Date(saved.savedAt).toLocaleDateString()}
+                  </div>
+                  <button
+                    onClick={() => handleLoadAnalysis(saved)}
+                    className="mt-auto w-full py-1.5 rounded-lg text-xs font-semibold transition-colors border border-[var(--accent)]/30 bg-[var(--accent)]/10 text-[var(--accent)] hover:bg-[var(--accent)]/20"
+                  >
+                    {Object.keys(saved.dataByKeyword).length > 0 ? "⚡ Load Analysis" : "🔄 Load & Fetch"}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
 
         {/* Loading */}
         {loading && (
