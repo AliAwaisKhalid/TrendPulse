@@ -293,6 +293,52 @@ function resampleToFreq(rows: TrendRow[], freq: Frequency): TrendRow[] {
   return result;
 }
 
+/* ─────────── Window Fetch Helpers ─────────── */
+/**
+ * Fetch a single time window from the /api/trends route.
+ * Returns raw rows (without keyword field) or null on failure.
+ */
+async function fetchWindow(
+  kw: string,
+  startISO: string,
+  endISO: string,
+  geo: string
+): Promise<Omit<TrendRow, "keyword">[] | null> {
+  try {
+    const params = new URLSearchParams({ keyword: kw, startDate: startISO, endDate: endISO });
+    if (geo) params.set("geo", geo);
+    const res = await fetch(`/api/trends?${params}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!Array.isArray(json.data) || !json.data.length) return null;
+    return json.data as Omit<TrendRow, "keyword">[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Merge rows from overlapping windows:
+ * 1. Group by datetime, average hits across duplicates.
+ * 2. Sort chronologically.
+ * 3. Globally renormalize hits to 0–100.
+ */
+function mergeWindowRows(rows: TrendRow[]): TrendRow[] {
+  if (!rows.length) return rows;
+  const map = new Map<string, { sum: number; count: number; row: TrendRow }>();
+  for (const row of rows) {
+    const ex = map.get(row.datetime);
+    if (ex) { ex.sum += row.hits; ex.count++; }
+    else map.set(row.datetime, { sum: row.hits, count: 1, row: { ...row } });
+  }
+  const merged = [...map.values()]
+    .sort((a, b) => a.row.datetime.localeCompare(b.row.datetime))
+    .map(({ sum, count, row }) => ({ ...row, hits: Math.round(sum / count) }));
+  // Globally renormalize to 0–100 so stitched windows are comparable
+  const maxH = Math.max(...merged.map((r) => r.hits), 1);
+  return merged.map((r) => ({ ...r, hits: Math.round((r.hits / maxH) * 100) }));
+}
+
 /* ─────────── R Script Generator ─────────── */
 function generateRScript(
   keywords: string[], startDate: string, endDate: string, freq: Frequency, geo: string
@@ -1029,35 +1075,59 @@ export default function TrendPulse() {
     let realCount = 0;
     let simCount = 0;
 
-    for (let i = 0; i < keywords.length; i++) {
-      const kw = keywords[i];
-      setFetchProgress(`Fetching "${kw}" (${i + 1}/${keywords.length})…`);
-      try {
-        const params = new URLSearchParams({ keyword: kw, startDate: startISO, endDate: endISO });
-        if (geo) params.set("geo", geo);
-        const res = await fetch(`/api/trends?${params}`);
-        if (res.ok) {
-          const json = await res.json();
-          if (Array.isArray(json.data) && json.data.length > 0) {
-            // Attach keyword field, then resample to the selected frequency
-            const withKw = (json.data as Omit<TrendRow, "keyword">[]).map((row) => ({ ...row, keyword: kw }));
-            newData[kw] = resampleToFreq(withKw, freq);
-            realCount++;
-          } else {
-            throw new Error("empty");
+    // Google Trends returns hourly data for windows ≤ 7 days, daily for longer.
+    // For sub-daily frequencies over ranges > 7 days we use a sliding 7-day
+    // window with 6-hour overlap (matching the R script strategy).
+    const rangeMs = end.getTime() - start.getTime();
+    const needsWindows =
+      freq !== "daily" && freq !== "weekly" && rangeMs > 7 * 86400000;
+    const WINDOW_MS  = 7 * 86400000;   // 7 days → Google returns hourly
+    const OVERLAP_MS = 6 * 3600000;    // 6 h overlap to smooth seam artefacts
+    const STEP_MS    = WINDOW_MS - OVERLAP_MS;
+
+    // Pre-compute window list once (same for all keywords)
+    const windows: { s: string; e: string }[] = needsWindows
+      ? (() => {
+          const ws: { s: string; e: string }[] = [];
+          for (let t = start.getTime(); t < end.getTime(); t += STEP_MS) {
+            ws.push({
+              s: toISODate(new Date(t)),
+              e: toISODate(new Date(Math.min(t + WINDOW_MS, end.getTime()))),
+            });
           }
-        } else {
-          throw new Error(`HTTP ${res.status}`);
-        }
-      } catch {
-        // Fallback: generate simulated data for this keyword
+          return ws;
+        })()
+      : [{ s: startISO, e: endISO }];
+
+    for (let ki = 0; ki < keywords.length; ki++) {
+      const kw = keywords[ki];
+      const allRows: TrendRow[] = [];
+
+      for (let wi = 0; wi < windows.length; wi++) {
+        const { s, e } = windows[wi];
+        setFetchProgress(
+          windows.length > 1
+            ? `"${kw}" (${ki + 1}/${keywords.length}) — window ${wi + 1}/${windows.length}`
+            : `Fetching "${kw}" (${ki + 1}/${keywords.length})…`
+        );
+        const raw = await fetchWindow(kw, s, e, geo);
+        if (raw) allRows.push(...raw.map((r) => ({ ...r, keyword: kw })));
+        // 600 ms between window calls to avoid hitting Google's rate limit
+        if (wi < windows.length - 1) await new Promise((r) => setTimeout(r, 600));
+      }
+
+      if (allRows.length > 0) {
+        const base = windows.length > 1 ? mergeWindowRows(allRows) : allRows;
+        newData[kw] = resampleToFreq(base, freq);
+        realCount++;
+      } else {
+        // All windows failed — fall back to simulated data
         newData[kw] = generateSimulatedData(kw, start, end, freq, geo);
         simCount++;
       }
-      // Rate-limit: pause 800 ms between keywords to avoid hitting Google's limit
-      if (i < keywords.length - 1) {
-        await new Promise((resolve) => setTimeout(resolve, 800));
-      }
+
+      // 800 ms between keywords
+      if (ki < keywords.length - 1) await new Promise((r) => setTimeout(r, 800));
     }
 
     const source: "real" | "simulated" | "mixed" =
