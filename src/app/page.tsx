@@ -203,6 +203,96 @@ function generateSimulatedData(
   return rows;
 }
 
+/* ─────────── Resample Real Trend Data to Target Frequency ─────────── */
+/**
+ * Google Trends returns data at its own native resolution (daily for ~90-day
+ * ranges, weekly for longer ranges, hourly for very short ranges). This
+ * function resamples the raw rows to whatever frequency the user selected so
+ * exports always match the chosen interval.
+ *
+ * - targetStep < dataStep  → upsample via linear interpolation
+ * - targetStep > dataStep  → downsample by averaging within each bucket
+ * - targetStep ≈ dataStep  → return as-is
+ */
+function resampleToFreq(rows: TrendRow[], freq: Frequency): TrendRow[] {
+  if (rows.length < 2) return rows;
+  const targetStepMs = freqMinutes(freq) * 60000;
+
+  // Derive the native step from the first two rows
+  const t0 = new Date(`${rows[0].date}T${rows[0].time}:00Z`).getTime();
+  const t1 = new Date(`${rows[1].date}T${rows[1].time}:00Z`).getTime();
+  const dataStepMs = Math.abs(t1 - t0) || targetStepMs;
+
+  // Within 10 % → treat as same resolution, no resampling needed
+  if (Math.abs(targetStepMs - dataStepMs) / dataStepMs < 0.1) return rows;
+
+  const keyword = rows[0].keyword;
+  const points = rows.map((r) => ({
+    ts: new Date(`${r.date}T${r.time}:00Z`).getTime(),
+    hits: r.hits,
+  }));
+  const startTs = points[0].ts;
+  const endTs = points[points.length - 1].ts;
+  const result: TrendRow[] = [];
+
+  if (targetStepMs < dataStepMs) {
+    /* ── Upsample: linear interpolation ── */
+    for (let ts = startTs; ts <= endTs; ts += targetStepMs) {
+      // Binary search for the surrounding native points
+      let lo = 0, hi = points.length - 1;
+      while (lo < hi - 1) {
+        const mid = (lo + hi) >> 1;
+        if (points[mid].ts <= ts) lo = mid; else hi = mid;
+      }
+      const loP = points[lo];
+      const hiP = points[Math.min(hi, points.length - 1)];
+      const frac = loP.ts < hiP.ts ? (ts - loP.ts) / (hiP.ts - loP.ts) : 0;
+      const hits = Math.max(0, Math.min(100, Math.round(loP.hits + frac * (hiP.hits - loP.hits))));
+      const dt = new Date(ts);
+      const dateStr = dt.toISOString().slice(0, 10);
+      const timeStr = dt.toISOString().slice(11, 16);
+      const dow = dt.getUTCDay();
+      result.push({
+        keyword, datetime: `${dateStr} ${timeStr}`,
+        date: dateStr, time: timeStr,
+        year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate(),
+        hour: dt.getUTCHours(), minute: dt.getUTCMinutes(),
+        dow, dowName: DOW_NAMES[dow],
+        quarter: Math.floor(dt.getUTCMonth() / 3) + 1,
+        weekend: dow === 0 || dow === 6,
+        hits,
+      });
+    }
+  } else {
+    /* ── Downsample: average hits within each target bucket ── */
+    let bucketStart = startTs;
+    while (bucketStart <= endTs) {
+      const bucketEnd = bucketStart + targetStepMs;
+      const inBucket = points.filter((p) => p.ts >= bucketStart && p.ts < bucketEnd);
+      const hits = inBucket.length
+        ? Math.round(inBucket.reduce((s, p) => s + p.hits, 0) / inBucket.length)
+        : 0;
+      const dt = new Date(bucketStart);
+      const dateStr = dt.toISOString().slice(0, 10);
+      const timeStr = dt.toISOString().slice(11, 16);
+      const dow = dt.getUTCDay();
+      result.push({
+        keyword, datetime: `${dateStr} ${timeStr}`,
+        date: dateStr, time: timeStr,
+        year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate(),
+        hour: dt.getUTCHours(), minute: dt.getUTCMinutes(),
+        dow, dowName: DOW_NAMES[dow],
+        quarter: Math.floor(dt.getUTCMonth() / 3) + 1,
+        weekend: dow === 0 || dow === 6,
+        hits,
+      });
+      bucketStart = bucketEnd;
+    }
+  }
+
+  return result;
+}
+
 /* ─────────── R Script Generator ─────────── */
 function generateRScript(
   keywords: string[], startDate: string, endDate: string, freq: Frequency, geo: string
@@ -949,8 +1039,9 @@ export default function TrendPulse() {
         if (res.ok) {
           const json = await res.json();
           if (Array.isArray(json.data) && json.data.length > 0) {
-            // Attach keyword field (API route doesn't include it in rows)
-            newData[kw] = (json.data as Omit<TrendRow, "keyword">[]).map((row) => ({ ...row, keyword: kw }));
+            // Attach keyword field, then resample to the selected frequency
+            const withKw = (json.data as Omit<TrendRow, "keyword">[]).map((row) => ({ ...row, keyword: kw }));
+            newData[kw] = resampleToFreq(withKw, freq);
             realCount++;
           } else {
             throw new Error("empty");

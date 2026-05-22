@@ -31,7 +31,6 @@ export async function GET(request: NextRequest) {
     const timelineData: any[] = parsed?.default?.timelineData ?? [];
 
     const data = timelineData
-      .filter((pt: any) => !pt.isPartial)
       .map((pt: any) => {
         const ts = new Date(parseInt(pt.time) * 1000);
         const dateStr = ts.toISOString().slice(0, 10);
