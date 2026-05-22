@@ -10,9 +10,23 @@ import {
   Tooltip,
   ResponsiveContainer,
   Brush,
+  ReferenceLine,
+  ReferenceArea,
 } from "recharts";
 import { saveAs } from "file-saver";
 import * as XLSX from "xlsx";
+import {
+  Document,
+  Packer,
+  Paragraph,
+  Table,
+  TableRow,
+  TableCell,
+  TextRun,
+  HeadingLevel,
+  AlignmentType,
+  WidthType,
+} from "docx";
 
 /* ─────────── Types ─────────── */
 interface TrendRow {
@@ -406,6 +420,285 @@ twoway bar avg_hits s_hour, ///
 `;
 }
 
+/* ─────────── Descriptive Statistics ─────────── */
+interface FullStats {
+  n: number;
+  mean: number;
+  median: number;
+  variance: number;
+  stdDev: number;
+  skewness: number;
+  kurtosis: number; // excess kurtosis
+  min: number;
+  max: number;
+}
+
+function computeStats(hits: number[]): FullStats | null {
+  const n = hits.length;
+  if (n === 0) return null;
+  const mean = hits.reduce((a, b) => a + b, 0) / n;
+  const sorted = [...hits].sort((a, b) => a - b);
+  const median =
+    n % 2 === 0
+      ? (sorted[n / 2 - 1] + sorted[n / 2]) / 2
+      : sorted[Math.floor(n / 2)];
+  const variance = hits.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
+  const stdDev = Math.sqrt(variance);
+  const skewness =
+    stdDev === 0
+      ? 0
+      : hits.reduce((a, b) => a + ((b - mean) / stdDev) ** 3, 0) / n;
+  const kurtosis =
+    stdDev === 0
+      ? 0
+      : hits.reduce((a, b) => a + ((b - mean) / stdDev) ** 4, 0) / n - 3;
+  return { n, mean, median, variance, stdDev, skewness, kurtosis, min: sorted[0], max: sorted[n - 1] };
+}
+
+/* ─────────── DOCX Report Generator ─────────── */
+function docCell(text: string, bold = false, bg?: string): TableCell {
+  return new TableCell({
+    children: [
+      new Paragraph({
+        children: [
+          new TextRun({ text, bold, size: bold ? 22 : 20, color: bold ? "1a1a2e" : "2d2d4a" }),
+        ],
+      }),
+    ],
+    shading: bg ? { fill: bg, type: "clear", color: "auto" } : undefined,
+    margins: { top: 80, bottom: 80, left: 120, right: 120 },
+  });
+}
+
+function statsTable(s: FullStats): Table {
+  const rows = [
+    ["Metric", "Value", "Metric", "Value"],
+    ["N (observations)", s.n.toLocaleString(), "Std Dev", s.stdDev.toFixed(3)],
+    ["Mean", s.mean.toFixed(3), "Skewness", s.skewness.toFixed(4)],
+    ["Median", s.median.toFixed(3), "Kurtosis (excess)", s.kurtosis.toFixed(4)],
+    ["Variance", s.variance.toFixed(3), "Min / Max", `${s.min} / ${s.max}`],
+  ];
+  return new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    rows: rows.map((r, i) =>
+      new TableRow({
+        children: r.map((cell, ci) =>
+          docCell(cell, i === 0, i === 0 ? "c8f0e0" : ci % 2 === 0 ? "f5f5f8" : "ffffff")
+        ),
+      })
+    ),
+  });
+}
+
+async function generateDocxReport(params: {
+  keyword: string;
+  startDate: string;
+  endDate: string;
+  freq: Frequency;
+  geo: string;
+  data: TrendRow[];
+  cutoffDate: string;
+  fullStats: FullStats;
+  beforeStats: FullStats | null;
+  afterStats: FullStats | null;
+}): Promise<Blob> {
+  const { keyword, startDate, endDate, freq, geo, data, cutoffDate, fullStats, beforeStats, afterStats } = params;
+  const country = COUNTRIES[geo] || "Worldwide";
+  const now = new Date().toLocaleString();
+
+  const h = (text: string, level: typeof HeadingLevel[keyof typeof HeadingLevel]) =>
+    new Paragraph({ text, heading: level, spacing: { before: 300, after: 120 } });
+
+  const p = (text: string, spacing = 120) =>
+    new Paragraph({
+      children: [new TextRun({ text, size: 20, color: "2d2d4a" })],
+      spacing: { after: spacing },
+    });
+
+  const divider = () =>
+    new Paragraph({
+      text: "─".repeat(60),
+      spacing: { before: 100, after: 100 },
+      children: [new TextRun({ text: "─".repeat(60), color: "ccccdd", size: 16 })],
+    });
+
+  const children = [
+    /* ── Title ── */
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 60 },
+      children: [new TextRun({ text: "TREND PULSE", bold: true, size: 48, color: "007a50" })],
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 80 },
+      children: [new TextRun({ text: "Google Trends Analysis Report", size: 28, color: "5555aa" })],
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 400 },
+      children: [new TextRun({ text: `Generated: ${now}`, size: 18, color: "888899" })],
+    }),
+
+    /* ── Overview ── */
+    h("1. Analysis Overview", HeadingLevel.HEADING_1),
+    new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      rows: [
+        ["Keyword Added", keyword],
+        ["Date Range", `${startDate} → ${endDate}`],
+        ["Frequency", `${freq} (${freqMinutes(freq as Frequency)} minutes)`],
+        ["Region", country],
+        ["Total Data Points", fullStats.n.toLocaleString()],
+        ["Cutoff Date", cutoffDate || "Not set"],
+      ].map(([label, val]) =>
+        new TableRow({
+          children: [
+            docCell(label, true, "e8f5ee"),
+            docCell(val, false, "ffffff"),
+          ],
+        })
+      ),
+    }),
+
+    divider(),
+
+    /* ── Data Collection Process ── */
+    h("2. Data Collection Process", HeadingLevel.HEADING_1),
+    p(
+      "Google Trends provides a normalized search interest index (0–100) where 100 represents " +
+      "the peak popularity for the keyword in the given time period. The API restricts high-resolution " +
+      "(sub-hourly) data to short windows of ≤ 7 days."
+    ),
+    p(
+      `To overcome this limitation, Trend Pulse uses an overlapping 24-hour window strategy: ` +
+      `the date range (${startDate} → ${endDate}) is divided into consecutive 24-hour windows, ` +
+      `each overlapping the previous by 4 hours. Within each window, Google returns approximately ` +
+      `one observation per minute, yielding the maximum available resolution.`
+    ),
+    p(
+      "Each window's index is scaled 0–100 independently by Google. After collection, overlapping " +
+      "observations at the same timestamp are averaged to smooth seam artefacts. The full series is " +
+      `then globally re-normalized to 0–100, and aggregated to the target frequency (${freq}) ` +
+      "by averaging within each bucket. This produces a continuous, uniformly-spaced time series " +
+      "suitable for econometric and statistical analysis."
+    ),
+    p(
+      "A second, separate API call retrieves the official daily series over the full date range. " +
+      "Google returns this directly as daily aggregates when the window exceeds approximately 7 days, " +
+      "providing an independent cross-check on the intraday series."
+    ),
+
+    divider(),
+
+    /* ── Timeline ── */
+    h("3. Timeline", HeadingLevel.HEADING_1),
+    new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      rows: [
+        ["Start Date", startDate],
+        ["End Date", endDate],
+        ["Duration", `${Math.round((new Date(endDate).getTime() - new Date(startDate).getTime()) / 86400000)} days`],
+        ["Data Resolution", `${freq} intervals (${freqMinutes(freq as Frequency)} min)`],
+        ["First Observation", data[0]?.datetime ?? "—"],
+        ["Last Observation", data[data.length - 1]?.datetime ?? "—"],
+        ["Collection Method", "Overlapping 24h windows (4h overlap) + direct daily call"],
+      ].map(([label, val]) =>
+        new TableRow({
+          children: [docCell(label, true, "e8f5ee"), docCell(val, false, "ffffff")],
+        })
+      ),
+    }),
+
+    divider(),
+
+    /* ── Descriptive Statistics ── */
+    h("4. Descriptive Statistics — Full Series", HeadingLevel.HEADING_1),
+    p(
+      "Statistics computed on the Google Trends interest index (0–100 scale). " +
+      "Skewness measures asymmetry of the distribution; values near 0 are symmetric. " +
+      "Excess kurtosis measures tail heaviness relative to a normal distribution (0 = normal, " +
+      "> 0 = heavy-tailed leptokurtic, < 0 = light-tailed platykurtic)."
+    ),
+    statsTable(fullStats),
+  ];
+
+  /* ── Cutoff Analysis ── */
+  if (cutoffDate && beforeStats && afterStats) {
+    children.push(
+      divider(),
+      h("5. Cutoff Date Analysis", HeadingLevel.HEADING_1),
+      p(
+        `The series is split at cutoff date ${cutoffDate} to examine structural changes in search interest. ` +
+        `The "Before" period covers ${beforeStats.n.toLocaleString()} observations ` +
+        `and the "After" period covers ${afterStats.n.toLocaleString()} observations.`
+      ),
+      h("Before Cutoff", HeadingLevel.HEADING_2),
+      statsTable(beforeStats),
+      new Paragraph({ text: "", spacing: { after: 200 } }),
+      h("After Cutoff", HeadingLevel.HEADING_2),
+      statsTable(afterStats),
+      new Paragraph({ text: "", spacing: { after: 200 } }),
+      h("Change Summary", HeadingLevel.HEADING_2),
+      new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        rows: [
+          ["Metric", "Before", "After", "Δ Change"],
+          ["Mean", beforeStats.mean.toFixed(2), afterStats.mean.toFixed(2), (afterStats.mean - beforeStats.mean).toFixed(2)],
+          ["Median", beforeStats.median.toFixed(2), afterStats.median.toFixed(2), (afterStats.median - beforeStats.median).toFixed(2)],
+          ["Variance", beforeStats.variance.toFixed(2), afterStats.variance.toFixed(2), (afterStats.variance - beforeStats.variance).toFixed(2)],
+          ["Std Dev", beforeStats.stdDev.toFixed(3), afterStats.stdDev.toFixed(3), (afterStats.stdDev - beforeStats.stdDev).toFixed(3)],
+          ["Skewness", beforeStats.skewness.toFixed(4), afterStats.skewness.toFixed(4), (afterStats.skewness - beforeStats.skewness).toFixed(4)],
+          ["Kurtosis", beforeStats.kurtosis.toFixed(4), afterStats.kurtosis.toFixed(4), (afterStats.kurtosis - beforeStats.kurtosis).toFixed(4)],
+        ].map((r, i) =>
+          new TableRow({
+            children: r.map((cell, ci) =>
+              docCell(cell, i === 0, i === 0 ? "c8f0e0" : ci % 2 === 0 ? "f5f5f8" : "ffffff")
+            ),
+          })
+        ),
+      })
+    );
+  }
+
+  /* ── Variance Extraction Notes ── */
+  const varSection = cutoffDate ? "6" : "5";
+  children.push(
+    divider(),
+    h(`${varSection}. Notes on Variance Extraction`, HeadingLevel.HEADING_1),
+    p(
+      "Variance in this context measures the temporal dispersion of search interest around its mean. " +
+      "A high variance indicates large swings in public interest — typical of trending news events, " +
+      "viral content, or seasonal products. A low variance indicates stable, consistent search behaviour."
+    ),
+    p(
+      "The windowed collection approach preserves intraday variance that is lost in Google's standard " +
+      "daily view. Each 24-hour window captures the full intraday cycle (0–100 within the window), " +
+      "and the global re-normalization stitches windows into a single comparable series. " +
+      "The resulting variance therefore reflects both intraday rhythms (hourly, daily patterns) and " +
+      "longer-term trends (weekly cycles, event spikes)."
+    ),
+    p(
+      `Full-series variance: ${fullStats.variance.toFixed(3)} (std dev: ${fullStats.stdDev.toFixed(3)}). ` +
+      (cutoffDate && beforeStats && afterStats
+        ? `Variance before cutoff: ${beforeStats.variance.toFixed(3)}; ` +
+          `after cutoff: ${afterStats.variance.toFixed(3)}. ` +
+          (afterStats.variance > beforeStats.variance
+            ? "Variance increased after the cutoff date, suggesting greater fluctuation in the later period."
+            : "Variance decreased after the cutoff date, suggesting more stable search interest in the later period.")
+        : "")
+    )
+  );
+
+  const doc = new Document({
+    creator: "Trend Pulse",
+    title: `${keyword} — Google Trends Analysis Report`,
+    description: `Analysis report for keyword "${keyword}" from ${startDate} to ${endDate}`,
+    sections: [{ children }],
+  });
+  return await Packer.toBlob(doc);
+}
+
 /* ─────────── Components ─────────── */
 
 function Badge({ children, variant = "default" }: { children: React.ReactNode; variant?: "default" | "accent" | "muted" }) {
@@ -487,6 +780,9 @@ export default function TrendPulse() {
   const [loading, setLoading] = useState(false);
   const [fetched, setFetched] = useState(false);
 
+  // Cutoff date state
+  const [cutoffDate, setCutoffDate] = useState("");
+
   // Table state
   const [sortField, setSortField] = useState<SortField>("datetime");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
@@ -541,15 +837,39 @@ export default function TrendPulse() {
   const effDays = rangeDays(range.start, range.end);
   const estPoints = Math.floor((effDays * 1440) / freqMinutes(freq));
 
+  const fullStats = useMemo(
+    () => computeStats(data.map((d) => d.hits)),
+    [data]
+  );
+
+  const cutoffStats = useMemo(() => {
+    if (!data.length || !cutoffDate) return null;
+    const before = computeStats(
+      data.filter((d) => d.date < cutoffDate).map((d) => d.hits)
+    );
+    const after = computeStats(
+      data.filter((d) => d.date >= cutoffDate).map((d) => d.hits)
+    );
+    return { before, after };
+  }, [data, cutoffDate]);
+
+  /* First datetime >= cutoffDate — used by ReferenceLine */
+  const cutoffXValue = useMemo(
+    () => (cutoffDate ? data.find((d) => d.date >= cutoffDate)?.datetime ?? null : null),
+    [data, cutoffDate]
+  );
+
   const stats = useMemo(() => {
-    if (!data.length) return null;
-    const hits = data.map((d) => d.hits);
-    const avg = hits.reduce((a, b) => a + b, 0) / hits.length;
-    const max = Math.max(...hits);
-    const min = Math.min(...hits);
-    const maxRow = data.find((d) => d.hits === max);
-    return { avg: avg.toFixed(1), max, min, maxRow, total: data.length };
-  }, [data]);
+    if (!fullStats) return null;
+    const maxRow = data.find((d) => d.hits === fullStats.max);
+    return {
+      avg: fullStats.mean.toFixed(1),
+      max: fullStats.max,
+      min: fullStats.min,
+      maxRow,
+      total: fullStats.n,
+    };
+  }, [data, fullStats]);
 
   const handleSort = (field: SortField) => {
     if (sortField === field) {
@@ -619,6 +939,24 @@ export default function TrendPulse() {
     const doFile = generateStataDoFile(keyword, freq);
     const blob = new Blob([doFile], { type: "text/plain;charset=utf-8" });
     saveAs(blob, `${keyword.replace(/\s+/g, "_")}_trends.do`);
+  };
+
+  const exportDocx = async () => {
+    if (!fullStats) return;
+    const { start, end } = effectiveRange(dateMode, days, startDate, endDate);
+    const blob = await generateDocxReport({
+      keyword,
+      startDate: toISODate(start),
+      endDate: toISODate(end),
+      freq,
+      geo,
+      data,
+      cutoffDate,
+      fullStats,
+      beforeStats: cutoffStats?.before ?? null,
+      afterStats: cutoffStats?.after ?? null,
+    });
+    saveAs(blob, `${keyword.replace(/\s+/g, "_")}_trends_report.docx`);
   };
 
   const TABLE_COLS: { key: SortField; label: string; mono?: boolean }[] = [
@@ -841,6 +1179,35 @@ export default function TrendPulse() {
             </div>
           </div>
 
+          {/* Cutoff date row */}
+          <div className="mt-4 pt-4 border-t border-[var(--border)] flex flex-wrap items-center gap-4">
+            <div className="flex items-center gap-3 flex-1 min-w-[260px]">
+              <label className="text-[11px] uppercase tracking-widest text-[var(--text-muted)] font-semibold whitespace-nowrap">
+                Analysis cutoff
+              </label>
+              <input
+                type="date"
+                value={cutoffDate}
+                onChange={(e) => setCutoffDate(e.target.value)}
+                className="px-3 py-2 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-primary)] focus:outline-none focus:border-[var(--warning)] transition-colors font-mono text-sm"
+                style={{ borderColor: cutoffDate ? "var(--warning)" : undefined }}
+              />
+              {cutoffDate && (
+                <button
+                  onClick={() => setCutoffDate("")}
+                  className="px-3 py-2 rounded-lg text-xs text-[var(--text-muted)] border border-[var(--border)] hover:text-[var(--danger)] hover:border-[var(--danger)]/40 transition-colors"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            {cutoffDate && (
+              <span className="text-xs text-[var(--warning)] font-mono">
+                ◀ Before {cutoffDate} | After ▶
+              </span>
+            )}
+          </div>
+
           {/* Info bar */}
           <div className="mt-4 flex flex-wrap items-center gap-4 text-xs text-[var(--text-muted)]">
             <span className="flex items-center gap-1.5">
@@ -904,6 +1271,32 @@ export default function TrendPulse() {
               />
             </div>
 
+            {/* Descriptive Statistics */}
+            {fullStats && (
+              <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5">
+                <div className="text-[11px] uppercase tracking-widest text-[var(--text-muted)] mb-4 font-semibold">
+                  Descriptive Statistics — Interest (0–100)
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-8 gap-3">
+                  {[
+                    { label: "Mean", value: fullStats.mean.toFixed(2) },
+                    { label: "Median", value: fullStats.median.toFixed(2) },
+                    { label: "Std Dev", value: fullStats.stdDev.toFixed(3) },
+                    { label: "Variance", value: fullStats.variance.toFixed(2) },
+                    { label: "Skewness", value: fullStats.skewness.toFixed(4) },
+                    { label: "Kurtosis", value: fullStats.kurtosis.toFixed(4) },
+                    { label: "Min", value: String(fullStats.min) },
+                    { label: "Max", value: String(fullStats.max) },
+                  ].map((s) => (
+                    <div key={s.label} className="text-center">
+                      <div className="text-[10px] uppercase tracking-wider text-[var(--text-muted)] mb-1">{s.label}</div>
+                      <div className="font-mono text-sm font-bold text-[var(--text-primary)]">{s.value}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Tabs */}
             <div className="flex items-center gap-1 border-b border-[var(--border)]">
               {(
@@ -929,85 +1322,137 @@ export default function TrendPulse() {
 
             {/* ─── Chart Tab ─── */}
             {activeTab === "chart" && (
-              <div
-                className="animate-fade-in-up rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-6"
-                style={{ animationDelay: "80ms" }}
-              >
-                <h3 className="text-sm font-semibold text-[var(--text-secondary)] mb-4 uppercase tracking-widest">
-                  Interest Over Time — &ldquo;{keyword}&rdquo;
-                </h3>
-                <div className="h-[400px]">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart
-                      data={data}
-                      margin={{ top: 5, right: 20, left: 0, bottom: 5 }}
-                    >
-                      <defs>
-                        <linearGradient
-                          id="areaGrad"
-                          x1="0"
-                          y1="0"
-                          x2="0"
-                          y2="1"
-                        >
-                          <stop
-                            offset="0%"
-                            stopColor="var(--accent)"
-                            stopOpacity={0.35}
+              <>
+                <div
+                  className="animate-fade-in-up rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-6"
+                  style={{ animationDelay: "80ms" }}
+                >
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-sm font-semibold text-[var(--text-secondary)] uppercase tracking-widest">
+                      Interest Over Time — &ldquo;{keyword}&rdquo;
+                    </h3>
+                    {cutoffXValue && (
+                      <span className="text-xs font-mono px-2 py-1 rounded-full border"
+                        style={{ color: "var(--warning)", borderColor: "var(--warning)", background: "var(--warning)11" }}>
+                        Cutoff: {cutoffDate}
+                      </span>
+                    )}
+                  </div>
+                  <div className="h-[400px]">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart
+                        data={data}
+                        margin={{ top: 5, right: 20, left: 0, bottom: 5 }}
+                      >
+                        <defs>
+                          <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.35} />
+                            <stop offset="100%" stopColor="var(--accent)" stopOpacity={0} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid
+                          strokeDasharray="3 3"
+                          stroke="var(--border)"
+                          vertical={false}
+                        />
+                        <XAxis
+                          dataKey="datetime"
+                          tickFormatter={formatAxisDate}
+                          tick={{ fill: "var(--text-muted)", fontSize: 11 }}
+                          axisLine={{ stroke: "var(--border)" }}
+                          tickLine={false}
+                          minTickGap={60}
+                        />
+                        <YAxis
+                          domain={[0, 100]}
+                          tick={{ fill: "var(--text-muted)", fontSize: 11 }}
+                          axisLine={false}
+                          tickLine={false}
+                          width={35}
+                        />
+                        <Tooltip content={<CustomTooltip />} />
+                        {/* Shade the "after cutoff" region */}
+                        {cutoffXValue && (
+                          <ReferenceArea
+                            x1={cutoffXValue}
+                            fill="#7c5cff"
+                            fillOpacity={0.07}
                           />
-                          <stop
-                            offset="100%"
-                            stopColor="var(--accent)"
-                            stopOpacity={0}
+                        )}
+                        <Area
+                          type="monotone"
+                          dataKey="hits"
+                          stroke="var(--accent)"
+                          strokeWidth={1.5}
+                          fill="url(#areaGrad)"
+                          dot={false}
+                          activeDot={{ r: 4, fill: "var(--accent)", stroke: "var(--bg-primary)", strokeWidth: 2 }}
+                        />
+                        {/* Cutoff vertical line */}
+                        {cutoffXValue && (
+                          <ReferenceLine
+                            x={cutoffXValue}
+                            stroke="#ffb347"
+                            strokeWidth={2}
+                            strokeDasharray="6 3"
+                            label={{
+                              value: cutoffDate,
+                              position: "insideTopRight",
+                              fill: "#ffb347",
+                              fontSize: 10,
+                              fontFamily: "monospace",
+                            }}
                           />
-                        </linearGradient>
-                      </defs>
-                      <CartesianGrid
-                        strokeDasharray="3 3"
-                        stroke="var(--border)"
-                        vertical={false}
-                      />
-                      <XAxis
-                        dataKey="datetime"
-                        tickFormatter={formatAxisDate}
-                        tick={{ fill: "var(--text-muted)", fontSize: 11 }}
-                        axisLine={{ stroke: "var(--border)" }}
-                        tickLine={false}
-                        minTickGap={60}
-                      />
-                      <YAxis
-                        domain={[0, 100]}
-                        tick={{ fill: "var(--text-muted)", fontSize: 11 }}
-                        axisLine={false}
-                        tickLine={false}
-                        width={35}
-                      />
-                      <Tooltip content={<CustomTooltip />} />
-                      <Area
-                        type="monotone"
-                        dataKey="hits"
-                        stroke="var(--accent)"
-                        strokeWidth={1.5}
-                        fill="url(#areaGrad)"
-                        dot={false}
-                        activeDot={{
-                          r: 4,
-                          fill: "var(--accent)",
-                          stroke: "var(--bg-primary)",
-                          strokeWidth: 2,
-                        }}
-                      />
-                      <Brush
-                        dataKey="datetime"
-                        height={28}
-                        stroke="var(--border-accent)"
-                        fill="var(--bg-secondary)"
-                        tickFormatter={formatAxisDate}
-                      />
-                    </AreaChart>
-                  </ResponsiveContainer>
+                        )}
+                        <Brush
+                          dataKey="datetime"
+                          height={28}
+                          stroke="var(--border-accent)"
+                          fill="var(--bg-secondary)"
+                          tickFormatter={formatAxisDate}
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
                 </div>
-              </div>
+
+                {/* Before / After cutoff comparison */}
+                {cutoffStats?.before && cutoffStats?.after && (
+                  <div className="animate-fade-in-up grid grid-cols-1 md:grid-cols-2 gap-4" style={{ animationDelay: "120ms" }}>
+                    {[
+                      { label: "Before Cutoff", s: cutoffStats.before, color: "var(--accent)", prefix: `< ${cutoffDate}` },
+                      { label: "After Cutoff", s: cutoffStats.after, color: "#7c5cff", prefix: `≥ ${cutoffDate}` },
+                    ].map(({ label, s, color, prefix }) => (
+                      <div key={label} className="rounded-2xl border bg-[var(--bg-card)] p-5"
+                        style={{ borderColor: color + "55" }}>
+                        <div className="flex items-center gap-2 mb-4">
+                          <span className="w-2 h-2 rounded-full" style={{ background: color }} />
+                          <span className="text-xs font-semibold uppercase tracking-widest" style={{ color }}>
+                            {label}
+                          </span>
+                          <span className="ml-auto font-mono text-[11px] text-[var(--text-muted)]">{prefix}</span>
+                          <span className="font-mono text-[11px] text-[var(--text-muted)]">n={s.n.toLocaleString()}</span>
+                        </div>
+                        <div className="grid grid-cols-3 gap-3">
+                          {[
+                            { lbl: "Mean", val: s.mean.toFixed(2) },
+                            { lbl: "Median", val: s.median.toFixed(2) },
+                            { lbl: "Std Dev", val: s.stdDev.toFixed(3) },
+                            { lbl: "Variance", val: s.variance.toFixed(2) },
+                            { lbl: "Skewness", val: s.skewness.toFixed(4) },
+                            { lbl: "Kurtosis", val: s.kurtosis.toFixed(4) },
+                          ].map((m) => (
+                            <div key={m.lbl} className="text-center py-2 rounded-lg bg-[var(--bg-secondary)]">
+                              <div className="text-[10px] uppercase tracking-wider text-[var(--text-muted)] mb-0.5">{m.lbl}</div>
+                              <div className="font-mono text-sm font-bold" style={{ color }}>{m.val}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
             )}
 
             {/* ─── Table Tab ─── */}
@@ -1138,6 +1583,14 @@ export default function TrendPulse() {
                     ext: ".do + .csv",
                     handler: exportStata,
                     color: "#FF9800",
+                  },
+                  {
+                    title: "Word Report",
+                    desc: "Full .docx analysis report: keywords, collection process, timeline, variance extraction, and descriptive statistics (mean, median, skewness, kurtosis). Includes before/after cutoff comparison if a cutoff date is set.",
+                    icon: "📝",
+                    ext: ".docx",
+                    handler: exportDocx,
+                    color: "#2B579A",
                   },
                 ].map((exp) => (
                   <button
