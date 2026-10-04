@@ -31,11 +31,11 @@ export default function ResolutionComparison({ data, keywords }: { data: Record<
   }
 
   const exportCSV = () => {
-    const head = "keyword,pair,grid,n,n_eff,r_levels,ci_low,ci_high,ci_adj_low,ci_adj_high,r_changes,ci_changes_low,ci_changes_high,ci_changes_adj_low,ci_changes_adj_high\n";
+    const head = "keyword,pair,grid,n,n_eff,r_levels,ci_low,ci_high,ci_adj_low,ci_adj_high,r_changes,ci_changes_low,ci_changes_high,ci_changes_adj_low,ci_changes_adj_high,r_changes_trimmed,n_trimmed\n";
     const body = available.flatMap((k) =>
       compareResolutions(data[k].hourly, data[k].m30, data[k].daily).pairs.map((p) =>
         [`"${k}"`, p.pair, p.grid, p.n, p.nEff.toFixed(1), p.r ?? "", p.ci?.[0] ?? "", p.ci?.[1] ?? "", p.ciAdj?.[0] ?? "", p.ciAdj?.[1] ?? "",
-          p.rDiff ?? "", p.ciDiff?.[0] ?? "", p.ciDiff?.[1] ?? "", p.ciDiffAdj?.[0] ?? "", p.ciDiffAdj?.[1] ?? ""].join(","))
+          p.rDiff ?? "", p.ciDiff?.[0] ?? "", p.ciDiff?.[1] ?? "", p.ciDiffAdj?.[0] ?? "", p.ciDiffAdj?.[1] ?? "", p.rDiffTrim ?? "", p.nTrim].join(","))
     ).join("\n");
     saveAs(new Blob([head + body], { type: "text/csv;charset=utf-8" }), "resolution_comparison.csv");
   };
@@ -67,7 +67,7 @@ export default function ResolutionComparison({ data, keywords }: { data: Record<
             <thead><tr className="border-b border-[var(--border)]">
               <th className={th}>Pair</th><th className={th}>Grid</th><th className={th}>N</th><th className={th}>N<sub>eff</sub></th>
               <th className={th}>r (levels)</th><th className={th}>95% CI, independent</th><th className={th}>95% CI, autocorr.-adjusted</th>
-              <th className={th}>r (changes)</th><th className={th}>95% CI (changes), adjusted</th>
+              <th className={th}>r (changes)</th><th className={th}>95% CI (changes), adjusted</th><th className={th}>r (changes, 5% largest jumps dropped)</th>
             </tr></thead>
             <tbody>
               {res.pairs.map((p) => (
@@ -75,7 +75,7 @@ export default function ResolutionComparison({ data, keywords }: { data: Record<
                   <td className="px-3 py-2 text-[var(--text-primary)]">{p.pair}</td>
                   <td className={td}>{p.grid}</td><td className={td}>{p.n}</td><td className={td}>{Math.round(p.nEff)}</td>
                   <td className={td}>{f2(p.r)}</td><td className={td}>{ci(p.ci)}</td><td className={td}>{ci(p.ciAdj)}</td>
-                  <td className={td}>{f2(p.rDiff)}</td><td className={td}>{ci(p.ciDiffAdj)}</td>
+                  <td className={td}>{f2(p.rDiff)}</td><td className={td}>{ci(p.ciDiffAdj)}</td><td className={td}>{f2(p.rDiffTrim)}</td>
                 </tr>
               ))}
             </tbody>
@@ -87,7 +87,7 @@ export default function ResolutionComparison({ data, keywords }: { data: Record<
           series are the informative ones. Confidence intervals use the Fisher z transform. The &quot;independent&quot; interval
           treats every observation as independent and is too narrow for autocorrelated series; the adjusted interval uses an
           AR(1) effective sample size, which is itself an approximation. Correlation in changes (first differences) is
-          the stricter test, because shared trends inflate correlation in levels.
+          the stricter test, because shared trends and a single regime jump inflate correlation in levels. The last column drops the 5% largest changes of the daily benchmark: if it is much lower than the full-sample value, the agreement is driven by a few jump days.
         </p>
       </div>
 
@@ -97,7 +97,7 @@ export default function ResolutionComparison({ data, keywords }: { data: Record<
         </div>
         <p className="text-[10px] text-[var(--text-muted)] mb-3">
           Sub-daily series are averaged to days and rescaled to the daily series (least squares through the origin). Bands are
-          95% intervals for the within-day mean (mean ± 1.96 SD/√n). The 30-minute band is narrower only because it counts
+          95% intervals for the within-day mean (mean ± 1.96 SD/√n), clipped to the 0 to 100 range of the index. The 30-minute band is narrower only because it counts
           interpolated points as extra observations.
         </p>
         <div className="h-[320px]">
@@ -105,7 +105,7 @@ export default function ResolutionComparison({ data, keywords }: { data: Record<
             <ComposedChart data={dayData} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
               <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
               <XAxis dataKey="date" tick={axis} axisLine={{ stroke: "var(--border)" }} tickLine={false} minTickGap={40} />
-              <YAxis tick={axis} axisLine={false} tickLine={false} width={35} />
+              <YAxis domain={[0, "auto"]} tick={axis} axisLine={false} tickLine={false} width={35} />
               <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border)", fontSize: 11 }} />
               <Legend wrapperStyle={{ fontSize: 11 }} />
               <Area type="monotone" dataKey="m30Band" name="30-min 95% band (naive)" stroke="none" fill="#f59e0b" fillOpacity={0.15} isAnimationActive={false} />

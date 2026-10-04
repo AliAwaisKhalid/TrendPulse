@@ -1293,9 +1293,15 @@ export default function TrendPulse() {
     const windows: Win[] = needsWindows
       ? (() => {
           const ws: Win[] = [];
-          for (let t = start.getTime(); t < end.getTime(); t += STEP_MS) {
-            const stT = new Date(t), etT = new Date(Math.min(t + WINDOW_MS - 1000, end.getTime()));
+          // Every window must have the full length: a shorter window makes Google return finer
+          // (for example 16-minute) points that do not align with the hourly grid and cannot be
+          // rescaled. The final window is therefore anchored to the end of the range.
+          for (let t = start.getTime(); ; t += STEP_MS) {
+            const last = t + WINDOW_MS >= end.getTime();
+            const t0 = last ? Math.max(end.getTime() - WINDOW_MS + 1000, start.getTime()) : t;
+            const stT = new Date(t0), etT = new Date(Math.min(t0 + WINDOW_MS - 1000, end.getTime()));
             ws.push({ s: toISODate(stT), e: toISODate(etT), st: stT.toISOString(), et: etT.toISOString() });
+            if (last) break;
           }
           return ws;
         })()
@@ -1328,6 +1334,7 @@ export default function TrendPulse() {
           let m = raw.map((r) => ({ ...r, keyword: kw })) as TrendRow[];
           if (!rawFirst.length) rawFirst = m;
           if (binMin) m = binToGrid(m, binMin);
+          else if (windowMode === "hourly6" && nativeStepMinutes(m) !== 60) m = binToGrid(m, 60); // safety: force the hourly grid
           allRows.push(...m);
           winRows.push(m);
         }

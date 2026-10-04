@@ -55,3 +55,11 @@ Deploy with `npx vercel --prod`, or push to a GitHub repository connected to Ver
 ## Author
 
 [Ali Awais Khalid](https://github.com/AliAwaisKhalid)
+
+
+## Data-source behaviour found in testing (October 2026)
+
+- The route requests granular data only when the window is shorter than 7 days **and** the request carries time-of-day boundaries. Earlier versions of this app never did, so their sub-daily series were daily data resampled.
+- Window length decides the native step: about 6 days gives hourly points; 1 to 2 days gives 8 to 16 minute points. The 24-hour window design of the manuscript therefore does not use an hourly source (select "24 h windows" in Window design to reproduce it; the app bins to a 30-minute grid and reports the native step).
+- The final window is anchored to the end of the range and has the full length. A shorter last window returned 16-minute points that did not align with the hourly grid, was never rescaled and distorted the end of the series (found in a run for 29 Dec 2025 to 26 Mar 2026).
+- Most Table 2 series are very sparse at hourly resolution (8 of 11 are more than 60% zero hours); correlations with the daily series are driven largely by one regime jump (around 1 March 2026). Use the "5% largest jumps dropped" column and the rolling 14-day correlation, not the full-sample level correlation, as evidence.

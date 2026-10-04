@@ -339,6 +339,9 @@ export interface PairStat {
   rDiff: number | null;
   ciDiff: CI | null;
   ciDiffAdj: CI | null;
+  /** Correlation of changes after dropping the 5% largest absolute changes of the benchmark (robustness to one regime jump). */
+  rDiffTrim: number | null;
+  nTrim: number;
 }
 
 export interface DailyCompareRow {
@@ -381,9 +384,15 @@ function pairStat(pair: string, grid: string, keys: string[], xs: number[], ys: 
   const rhoD = Math.max(acf1(dx) ?? 0, acf1(dy) ?? 0);
   const nEffD = effectiveN(dx.length, rhoD);
   void keys;
+  // Trimmed changes: drop the 5% largest absolute changes of the second series (the benchmark)
+  const absd = dy.map(Math.abs).sort((a, b) => a - b);
+  const cut = absd.length ? absd[Math.max(0, Math.ceil(absd.length * 0.95) - 1)] : 0;
+  const keep = dy.map((v, i) => (Math.abs(v) <= cut ? i : -1)).filter((i) => i >= 0);
+  const rdt = keep.length >= 8 ? pearson(keep.map((i) => dx[i]), keep.map((i) => dy[i])) : null;
   return {
     pair, grid, n, nEff, r, ci: fisherCI(r, n), ciAdj: fisherCI(r, nEff),
     rDiff: rd, ciDiff: fisherCI(rd, dx.length), ciDiffAdj: fisherCI(rd, nEffD),
+    rDiffTrim: rdt, nTrim: keep.length,
   };
 }
 
@@ -426,7 +435,7 @@ export function compareResolutions(
   const days: DailyCompareRow[] = allDays.map((d) => {
     const h = hD.get(d), m = mD.get(d);
     const band = (b: Bucket | undefined, s: number) =>
-      b ? { v: b.mean * s, lo: (b.mean - 1.96 * b.sd / Math.sqrt(b.n)) * s, hi: (b.mean + 1.96 * b.sd / Math.sqrt(b.n)) * s } : null;
+      b ? { v: b.mean * s, lo: Math.max(0, (b.mean - 1.96 * b.sd / Math.sqrt(b.n)) * s), hi: Math.min(100, (b.mean + 1.96 * b.sd / Math.sqrt(b.n)) * s) } : null;
     const hb = band(h, bH), mb = band(m, bM);
     return {
       date: d, daily: dD.get(d) ?? null,
