@@ -336,6 +336,24 @@ function binToGrid(rows: TrendRow[], stepMin: number): TrendRow[] {
   });
 }
 
+/** Rows of zeros on a regular grid, used for windows for which Google returned an empty timeline. */
+function zeroRows(kw: string, fromMs: number, toMs: number, stepMin: number): TrendRow[] {
+  const stepMs = stepMin * 60000;
+  const out: TrendRow[] = [];
+  for (let ts = Math.ceil(fromMs / stepMs) * stepMs; ts <= toMs; ts += stepMs) {
+    const dt = new Date(ts);
+    const dateStr = dt.toISOString().slice(0, 10), timeStr = dt.toISOString().slice(11, 16);
+    const dow = dt.getUTCDay();
+    out.push({
+      keyword: kw, datetime: `${dateStr} ${timeStr}`, date: dateStr, time: timeStr,
+      year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate(),
+      hour: dt.getUTCHours(), minute: dt.getUTCMinutes(), dow, dowName: DOW_NAMES[dow],
+      quarter: Math.floor(dt.getUTCMonth() / 3) + 1, weekend: dow === 0 || dow === 6, hits: 0,
+    } as TrendRow);
+  }
+  return out;
+}
+
 /* ─────────── Window Fetch Helpers ─────────── */
 /**
  * Fetch a single time window from the /api/trends route.
@@ -354,6 +372,9 @@ async function fetchWindow(
     if (startTime && endTime) { params.set("startTime", startTime); params.set("endTime", endTime); }
     if (geo) params.set("geo", geo);
     const res = await fetch(`/api/trends?${params}`);
+    // 404 "No data returned": Google returned an empty timeline (no measurable interest in the window).
+    // An empty array lets the caller treat the window as zeros; other failures stay null (missing).
+    if (res.status === 404) return [];
     if (!res.ok) return null;
     const json = await res.json();
     if (!Array.isArray(json.data) || !json.data.length) return null;
@@ -997,8 +1018,9 @@ function parseBulkKeywords(text: string, existing: string[]): string[] {
 const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
 const f2 = (v: number | null | undefined) => (v === null || v === undefined || !Number.isFinite(v) ? "n/a" : v.toFixed(2));
 
-function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windowDesc, anchors }: {
+function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windowDesc, anchors, empties }: {
   windowDesc: string;
+  empties: Record<string, { empty: number; total: number }>;
   anchors: Record<string, AnchorInfo>;
   diag: SeriesDiagnostics[];
   sparsity: SparsityStats[];
@@ -1089,6 +1111,7 @@ function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windo
                 <th className={th}>Keyword</th><th className={th}>Seams</th><th className={th}>Flagged</th>
                 <th className={th}>Cumulative scale at end</th><th className={th}>Min overlap corr.</th>
                 <th className={th}>Seams with rounding error of at least 25%</th>
+                <th className={th}>Windows with empty Google timeline (filled with zeros)</th>
               </tr></thead>
               <tbody>
                 {Object.entries(seams).map(([kw, ss]) => {
@@ -1101,6 +1124,7 @@ function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windo
                       <td className={td}>{ss.length ? ss[ss.length - 1].cumulativeScale.toFixed(2) : "n/a"}</td>
                       <td className={td}>{corrs.length ? f2(Math.min(...corrs)) : "n/a"}</td>
                       <td className={td}>{ss.filter((x) => x.relErr !== null && x.relErr >= 0.25).length}</td>
+                      <td className={td} style={{ color: (empties[kw]?.empty ?? 0) > 0 ? "#fbbf24" : undefined }}>{empties[kw] ? `${empties[kw].empty} of ${empties[kw].total}` : "n/a"}</td>
                     </tr>
                   );
                 })}
@@ -1242,6 +1266,7 @@ export default function TrendPulse() {
   const [windowMode, setWindowMode] = useState<"hourly6" | "paper24">("hourly6");
   const [stitchMode, setStitchMode] = useState<"chain" | "anchor">("chain");
   const [anchorByKw, setAnchorByKw] = useState<Record<string, AnchorInfo>>({});
+  const [emptyByKw, setEmptyByKw] = useState<Record<string, { empty: number; total: number }>>({});
   const [windowDesc, setWindowDesc] = useState("");
   const [categories, setCategories] = useState<Record<string, string>>({});
   const [runValidation, setRunValidation] = useState(true);
@@ -1298,7 +1323,7 @@ export default function TrendPulse() {
     setFetched(false);
     setDataSource(null);
     setFetchProgress("");
-    setDiagnostics([]); setSparsity([]); setResData({}); setSeamsByKw({}); setValidation([]); setRedownload({}); setAnchorByKw({});
+    setDiagnostics([]); setSparsity([]); setResData({}); setSeamsByKw({}); setValidation([]); setRedownload({}); setAnchorByKw({}); setEmptyByKw({});
 
     const { start, end } = effectiveRange(dateMode, days, startDate, endDate);
     const startISO = toISODate(start);
@@ -1313,6 +1338,7 @@ export default function TrendPulse() {
     const newVal: BenchmarkValidation[] = [];
     const newRedl: Record<string, { n: number; corr: number | null; mae: number | null }> = {};
     const newAnchor: Record<string, AnchorInfo> = {};
+    const newEmpty: Record<string, { empty: number; total: number }> = {};
 
     // Google returns hourly (or finer) points only for windows shorter than 7 days AND when the
     // request carries time-of-day boundaries; otherwise it returns daily points.
@@ -1360,6 +1386,7 @@ export default function TrendPulse() {
       const allRows: TrendRow[] = [];
       const winRows: TrendRow[][] = [];
       let rawFirst: TrendRow[] = [];
+      const emptyWins: number[] = [];
 
       for (let wi = 0; wi < windows.length; wi++) {
         const { s, e } = windows[wi];
@@ -1369,19 +1396,34 @@ export default function TrendPulse() {
             : `Fetching "${kw}" (${ki + 1}/${keywords.length})…`
         );
         const raw = await fetchWindow(kw, s, e, geo, windows[wi].st, windows[wi].et);
-        if (raw) {
+        if (raw && raw.length) {
           let m = raw.map((r) => ({ ...r, keyword: kw })) as TrendRow[];
           if (!rawFirst.length) rawFirst = m;
           if (binMin) m = binToGrid(m, binMin);
           else if (windowMode === "hourly6" && nativeStepMinutes(m) !== 60) m = binToGrid(m, 60); // safety: force the hourly grid
           allRows.push(...m);
           winRows.push(m);
+        } else if (raw && windows.length > 1 && windows[wi].st && windows[wi].et) {
+          // Empty timeline from Google: no measurable interest. Keep the grid regular with zeros
+          // (the number of such windows is reported; a keyword with no data in any window is not zero-filled).
+          emptyWins.push(wi);
+          winRows.push([]);
         }
         // 600 ms between window calls to avoid hitting Google's rate limit
         if (wi < windows.length - 1) await new Promise((r) => setTimeout(r, 600));
       }
 
+      if (allRows.length > 0 && emptyWins.length) {
+        const stepZ = binMin || 60;
+        for (const wi of emptyWins) {
+          const z = zeroRows(kw, Date.parse(windows[wi].st!), Date.parse(windows[wi].et!), stepZ);
+          winRows[wi] = z;
+          allRows.push(...z);
+        }
+        allRows.sort((a, b) => a.datetime.localeCompare(b.datetime));
+      }
       if (allRows.length > 0) {
+        newEmpty[kw] = { empty: emptyWins.length, total: windows.length };
         // The daily benchmark is fetched before stitching so that it can be used both as the
         // independent check and, if requested, to anchor window levels.
         const doValidate = runValidation && freq !== "daily" && freq !== "weekly";
@@ -1389,7 +1431,8 @@ export default function TrendPulse() {
         if (doValidate && rangeMs > 7 * 86400000 && rangeMs <= 260 * 86400000) {
           setFetchProgress(`Fetching the daily benchmark for "${kw}"…`);
           await new Promise((r) => setTimeout(r, 600));
-          dailyRows = (await fetchWindow(kw, startISO, endISO, geo)) as TrendRow[] | null;
+          const dr = (await fetchWindow(kw, startISO, endISO, geo)) as TrendRow[] | null;
+          dailyRows = dr && dr.length ? dr : null;
         }
         let base: TrendRow[] = allRows;
         let chainBase: TrendRow[] = allRows;
@@ -1420,10 +1463,10 @@ export default function TrendPulse() {
               ? { hourly: binToGrid(base, 60), m30: base, daily, anchored: anchoredOut }
               : { hourly: base, m30: resampleToFreq(base, "30min"), daily, anchored: anchoredOut };
           }
-          if (winRows[0]) {
+          if (winRows[0] && winRows[0].length && !emptyWins.includes(0)) {
             await new Promise((r) => setTimeout(r, 600));
             const again = await fetchWindow(kw, windows[0].s, windows[0].e, geo, windows[0].st, windows[0].et);
-            if (again) newRedl[kw] = redownloadAgreement(winRows[0], again as TrendRow[]);
+            if (again && again.length) newRedl[kw] = redownloadAgreement(winRows[0], again as TrendRow[]);
           }
         }
       } else {
@@ -1441,7 +1484,7 @@ export default function TrendPulse() {
       simCount > 0 && realCount === 0 ? "simulated" : "mixed";
 
     setDataByKeyword(newData);
-    setResData(newRes); setDiagnostics(newDiag); setSparsity(newSparse); setSeamsByKw(newSeams); setValidation(newVal); setRedownload(newRedl); setAnchorByKw(newAnchor);
+    setResData(newRes); setDiagnostics(newDiag); setSparsity(newSparse); setSeamsByKw(newSeams); setValidation(newVal); setRedownload(newRedl); setAnchorByKw(newAnchor); setEmptyByKw(newEmpty);
     setDataSource(source);
     setFetchProgress("");
     setLoading(false);
@@ -2290,7 +2333,7 @@ export default function TrendPulse() {
               </div>
             )}
 
-            <DiagnosticsPanel diag={diagnostics} seams={seamsByKw} validation={validation} redownload={redownload} sparsity={sparsity} windowDesc={windowDesc} anchors={anchorByKw} />
+            <DiagnosticsPanel diag={diagnostics} seams={seamsByKw} validation={validation} redownload={redownload} sparsity={sparsity} windowDesc={windowDesc} anchors={anchorByKw} empties={emptyByKw} />
 
             {/* Descriptive stats panel */}
             <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5">
