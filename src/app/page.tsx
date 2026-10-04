@@ -20,6 +20,15 @@ import {
   Legend,
 } from "recharts";
 import { saveAs } from "file-saver";
+import {
+  stitchWindows, seriesDiagnostics, validateAgainstDaily, redownloadAgreement,
+  sparsityStats, componentShareByCategory,
+  type SeriesDiagnostics, type SeamInfo, type BenchmarkValidation, type SparsityStats,
+} from "@/lib/diagnostics";
+import ResolutionComparison, { type ResolutionData } from "@/components/ResolutionComparison";
+import {
+  KEYWORD_PRESETS, HORMUZ_TABLE2, entriesToCSV, parseKeywordEntries, type KeywordEntry,
+} from "@/lib/keywords";
 import * as XLSX from "xlsx";
 import {
   Document,
@@ -50,6 +59,12 @@ interface TrendRow {
   quarter: number;
   weekend: boolean;
   hits: number;
+  /** Keyword category (e.g. "Shipping / Trade"), when supplied via import or preset. */
+  category?: string;
+  /** True when the value was linearly interpolated onto a grid finer than the source data. */
+  interpolated?: boolean;
+  /** True when the row is simulated fallback data, never Google Trends output. */
+  simulated?: boolean;
 }
 
 type Frequency =
@@ -261,6 +276,7 @@ function resampleToFreq(rows: TrendRow[], freq: Frequency): TrendRow[] {
         quarter: Math.floor(dt.getUTCMonth() / 3) + 1,
         weekend: dow === 0 || dow === 6,
         hits,
+        interpolated: frac > 0,
       });
     }
   } else {
@@ -317,31 +333,10 @@ async function fetchWindow(
   }
 }
 
-/**
- * Merge rows from overlapping windows:
- * 1. Group by datetime, average hits across duplicates.
- * 2. Sort chronologically.
- * 3. Globally renormalize hits to 0–100.
- */
-function mergeWindowRows(rows: TrendRow[]): TrendRow[] {
-  if (!rows.length) return rows;
-  const map = new Map<string, { sum: number; count: number; row: TrendRow }>();
-  for (const row of rows) {
-    const ex = map.get(row.datetime);
-    if (ex) { ex.sum += row.hits; ex.count++; }
-    else map.set(row.datetime, { sum: row.hits, count: 1, row: { ...row } });
-  }
-  const merged = [...map.values()]
-    .sort((a, b) => a.row.datetime.localeCompare(b.row.datetime))
-    .map(({ sum, count, row }) => ({ ...row, hits: Math.round(sum / count) }));
-  // Globally renormalize to 0–100 so stitched windows are comparable
-  const maxH = Math.max(...merged.map((r) => r.hits), 1);
-  return merged.map((r) => ({ ...r, hits: Math.round((r.hits / maxH) * 100) }));
-}
-
 /* ─────────── R Script Generator ─────────── */
 function generateRScript(
-  keywords: string[], startDate: string, endDate: string, freq: Frequency, geo: string
+  keywords: string[], startDate: string, endDate: string, freq: Frequency, geo: string,
+  categories: Record<string, string> = {}
 ): string {
   const fMin = freqMinutes(freq);
   const kwList = keywords.map((k) => `"${k}"`).join(", ");
@@ -350,6 +345,15 @@ function generateRScript(
 # Keywords: c(${kwList})
 # Range: ${startDate} → ${endDate} | Freq: ${freq} (${fMin} min) | Geo: ${geo || "worldwide"}
 # Outputs per-keyword intraday (${freq}) + daily CSVs, plus combined daily.
+#
+# DATA CAVEATS (read before using for Granger / VAR tests)
+#  * Google Trends serves ~hourly data for windows up to ~7 days. A ${fMin}-minute
+#    grid finer than 60 minutes adds no information: values are repeated or
+#    interpolated, which inflates short-lag autocorrelation and the apparent
+#    significance of Granger tests. Use the native hourly series (or coarser).
+#  * Each window is scaled 0-100 on its own. Stitching windows by overlap
+#    rescaling is not validated unless compared with the daily/weekly series
+#    for the same keyword, region and period (see the Diagnostics export).
 # ══════════════════════════════════════════════════
 
 library(gtrendsR)
@@ -357,6 +361,7 @@ library(dplyr)
 library(lubridate)
 
 keywords   <- c(${kwList})
+keyword_category <- c(${keywords.map((k) => `"${k}" = "${(categories[k] ?? "").replace(/"/g, "'")}"`).join(", ")})
 geo        <- ${geo ? `"${geo}"` : "NULL"}
 freq_min   <- ${fMin}
 start_date <- as.Date("${startDate}")
@@ -448,6 +453,9 @@ function generateStataDoFile(keywords: string[], freq: Frequency): string {
 * Trend Pulse — Stata Import & Time-Series Setup
 * Keywords: ${keywords.join(", ")} | Freq: ${freq}
 * Note: script uses the first keyword CSV. Run separately for each keyword.
+* CAUTION: Google Trends is ~hourly at best. Sub-hourly grids duplicate or
+* interpolate values, inflating autocorrelation and Granger-test significance.
+* Use the hourly (or coarser) export and the Diagnostics file for validation.
 * ══════════════════════════════════════════════════
 
 clear all
@@ -952,11 +960,156 @@ function computePCA(kwLabels: string[], dataByKw: Record<string, TrendRow[]>): P
 
 /* ─────────── Keyword Import Helpers ─────────── */
 function parseBulkKeywords(text: string, existing: string[]): string[] {
-  return text
-    .split(/[\n,]+/)
-    .map((k) => k.trim())
-    .filter((k) => k.length > 0 && !existing.includes(k))
-    .filter((k, i, arr) => arr.indexOf(k) === i); // deduplicate within batch
+  return parseKeywordEntries(text).map((e) => e.keyword).filter((k) => !existing.includes(k));
+}
+
+/* ─────────── Diagnostics Panel ─────────── */
+const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
+const f2 = (v: number | null | undefined) => (v === null || v === undefined || !Number.isFinite(v) ? "n/a" : v.toFixed(2));
+
+function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity }: {
+  diag: SeriesDiagnostics[];
+  sparsity: SparsityStats[];
+  seams: Record<string, SeamInfo[]>;
+  validation: BenchmarkValidation[];
+  redownload: Record<string, { n: number; corr: number | null; mae: number | null }>;
+}) {
+  if (!diag.length && !sparsity.length) return null;
+  const over = diag.filter((d) => d.oversampled);
+  const th = "px-3 py-2 text-left font-semibold text-[var(--text-muted)] uppercase tracking-wider text-[10px]";
+  const td = "px-3 py-2 font-mono text-[var(--text-secondary)]";
+  return (
+    <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5 space-y-4">
+      <div className="text-[11px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">
+        Data-source diagnostics: resolution and window stitching
+      </div>
+      {over.length > 0 ? (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-300 leading-relaxed">
+          The selected grid is finer than the source data. Google Trends supplies about one observation per
+          {" "}{Math.round(over[0].nativeStepMin)} minutes here, so the {Math.round(over[0].outputStepMin)}-minute series repeats or
+          interpolates values and adds no information. This inflates short-lag autocorrelation and the apparent
+          significance of Granger-causality tests, because the effective sample is much smaller than the number of rows
+          (see N<sub>eff</sub> below). Use the native-resolution series for inference.
+        </div>
+      ) : (
+        <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 p-3 text-xs text-emerald-400">
+          The output grid is not finer than the native resolution of the source data.
+        </div>
+      )}
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead><tr className="border-b border-[var(--border)]">
+            <th className={th}>Keyword</th><th className={th}>Native step</th><th className={th}>Output step</th>
+            <th className={th}>Rows per native obs.</th><th className={th}>Identical consecutive (native → output)</th>
+            <th className={th}>Lag-1 ACF (native → output)</th><th className={th}>N rows</th><th className={th}>N<sub>eff</sub> (AR1)</th>
+          </tr></thead>
+          <tbody>
+            {diag.map((d) => (
+              <tr key={d.keyword} className="border-b border-[var(--border)]/50">
+                <td className="px-3 py-2 text-[var(--text-primary)]">{d.keyword}</td>
+                <td className={td}>{Number.isFinite(d.nativeStepMin) ? `${Math.round(d.nativeStepMin)} min` : "n/a"}</td>
+                <td className={td}>{Math.round(d.outputStepMin)} min</td>
+                <td className={td}>{d.inflationFactor.toFixed(1)}×</td>
+                <td className={td}>{pct(d.identicalNative)} → {pct(d.identicalOutput)}</td>
+                <td className={td}>{f2(d.acf1Native)} → {f2(d.acf1Output)}</td>
+                <td className={td}>{d.nOutput.toLocaleString()}</td>
+                <td className={td}>{Math.round(d.nEffOutput).toLocaleString()}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {sparsity.length > 0 && (
+        <div className="space-y-2">
+          <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">
+            Noise and sparsity of the raw keyword series (before any PCA)
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead><tr className="border-b border-[var(--border)]">
+                <th className={th}>Keyword</th><th className={th}>N</th><th className={th}>Mean</th><th className={th}>CV</th>
+                <th className={th}>Zero share</th><th className={th}>At or below 5</th><th className={th}>Longest zero run</th>
+                <th className={th}>Lag-1 ACF</th><th className={th}>Flag</th>
+              </tr></thead>
+              <tbody>
+                {sparsity.map((q) => (
+                  <tr key={q.keyword} className="border-b border-[var(--border)]/50">
+                    <td className="px-3 py-2 text-[var(--text-primary)]">{q.keyword}</td>
+                    <td className={td}>{q.n.toLocaleString()}</td><td className={td}>{f2(q.mean)}</td><td className={td}>{f2(q.cv)}</td>
+                    <td className={td}>{pct(q.zeroShare)}</td><td className={td}>{pct(q.lowShare)}</td>
+                    <td className={td}>{q.maxZeroRun}</td><td className={td}>{f2(q.acf1)}</td>
+                    <td className={td} style={{ color: q.flag ? "#fbbf24" : undefined }}>{q.flag ?? "ok"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+      {Object.keys(seams).length > 0 && (
+        <div className="space-y-2">
+          <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">
+            Window stitching (7-day windows, 6-hour overlap, chained overlap rescaling)
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead><tr className="border-b border-[var(--border)]">
+                <th className={th}>Keyword</th><th className={th}>Seams</th><th className={th}>Flagged</th>
+                <th className={th}>Cumulative scale at end</th><th className={th}>Min overlap corr.</th>
+              </tr></thead>
+              <tbody>
+                {Object.entries(seams).map(([kw, ss]) => {
+                  const corrs = ss.map((x) => x.overlapCorr).filter((v): v is number => v !== null);
+                  return (
+                    <tr key={kw} className="border-b border-[var(--border)]/50">
+                      <td className="px-3 py-2 text-[var(--text-primary)]">{kw}</td>
+                      <td className={td}>{ss.length}</td>
+                      <td className={td} style={{ color: ss.some((x) => x.flag) ? "#fbbf24" : undefined }}>{ss.filter((x) => x.flag).length}</td>
+                      <td className={td}>{ss.length ? ss[ss.length - 1].cumulativeScale.toFixed(2) : "n/a"}</td>
+                      <td className={td}>{corrs.length ? f2(Math.min(...corrs)) : "n/a"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+      {validation.length > 0 && (
+        <div className="space-y-2">
+          <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">
+            Benchmark check: stitched series averaged to days vs the standard daily Google Trends series
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead><tr className="border-b border-[var(--border)]">
+                <th className={th}>Keyword</th><th className={th}>Days</th><th className={th}>Corr. (levels)</th>
+                <th className={th}>Spearman</th><th className={th}>Corr. (changes)</th><th className={th}>MAE after scaling</th>
+                <th className={th}>Re-download corr.</th><th className={th}>Screen</th>
+              </tr></thead>
+              <tbody>
+                {validation.map((v) => (
+                  <tr key={v.keyword} className="border-b border-[var(--border)]/50">
+                    <td className="px-3 py-2 text-[var(--text-primary)]">{v.keyword}</td>
+                    <td className={td}>{v.nDays}</td><td className={td}>{f2(v.corrLevels)}</td>
+                    <td className={td}>{f2(v.spearmanLevels)}</td><td className={td}>{f2(v.corrDiffs)}</td>
+                    <td className={td}>{f2(v.maeScaled)}</td><td className={td}>{f2(redownload[v.keyword]?.corr)}</td>
+                    <td className={td} style={{ color: v.verdict === "consistent" ? "#34d399" : v.verdict === "weak" ? "#fbbf24" : undefined }}>{v.verdict}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-[10px] text-[var(--text-muted)] leading-relaxed">
+            The screen is a heuristic (levels correlation ≥ 0.90 and changes correlation ≥ 0.50), not a significance test.
+            Agreement with the daily series is necessary, not sufficient, evidence that the stitching is sound.
+            The re-download column shows how closely two separate downloads of the first window agree; Google Trends
+            samples its data, so identical requests can differ.
+          </p>
+        </div>
+      )}
+    </div>
+  );
 }
 
 /* ─────────── UI Components ─────────── */
@@ -1011,7 +1164,7 @@ export default function TrendPulse() {
   const [dateMode, setDateMode] = useState<DateMode>("relative");
   const [startDate, setStartDate] = useState(() => toISODate(new Date(Date.now() - 90 * 86400000)));
   const [endDate, setEndDate] = useState(() => toISODate(new Date()));
-  const [freq, setFreq] = useState<Frequency>("30min");
+  const [freq, setFreq] = useState<Frequency>("1hour");
   const [geo, setGeo] = useState("");
 
   /* ── Data state ── */
@@ -1020,6 +1173,14 @@ export default function TrendPulse() {
   const [fetched, setFetched] = useState(false);
   const [dataSource, setDataSource] = useState<"real" | "simulated" | "mixed" | null>(null);
   const [fetchProgress, setFetchProgress] = useState<string>("");
+  const [categories, setCategories] = useState<Record<string, string>>({});
+  const [runValidation, setRunValidation] = useState(true);
+  const [diagnostics, setDiagnostics] = useState<SeriesDiagnostics[]>([]);
+  const [seamsByKw, setSeamsByKw] = useState<Record<string, SeamInfo[]>>({});
+  const [resData, setResData] = useState<Record<string, ResolutionData>>({});
+  const [sparsity, setSparsity] = useState<SparsityStats[]>([]);
+  const [validation, setValidation] = useState<BenchmarkValidation[]>([]);
+  const [redownload, setRedownload] = useState<Record<string, { n: number; corr: number | null; mae: number | null }>>({});
 
   /* ── Analysis state ── */
   const [cutoffDate, setCutoffDate] = useState("");
@@ -1031,7 +1192,7 @@ export default function TrendPulse() {
   const pageSize = 25;
 
   /* ── Tab state ── */
-  const [activeTab, setActiveTab] = useState<"chart" | "table" | "pca" | "exports">("chart");
+  const [activeTab, setActiveTab] = useState<"chart" | "table" | "pca" | "resolution" | "exports">("chart");
 
   /* ── Saved analyses ── */
   const [savedAnalyses, setSavedAnalyses] = useState<SavedAnalysis[]>(() => {
@@ -1067,6 +1228,7 @@ export default function TrendPulse() {
     setFetched(false);
     setDataSource(null);
     setFetchProgress("");
+    setDiagnostics([]); setSparsity([]); setResData({}); setSeamsByKw({}); setValidation([]); setRedownload({});
 
     const { start, end } = effectiveRange(dateMode, days, startDate, endDate);
     const startISO = toISODate(start);
@@ -1074,6 +1236,12 @@ export default function TrendPulse() {
     const newData: Record<string, TrendRow[]> = {};
     let realCount = 0;
     let simCount = 0;
+    const newRes: Record<string, ResolutionData> = {};
+    const newDiag: SeriesDiagnostics[] = [];
+    const newSparse: SparsityStats[] = [];
+    const newSeams: Record<string, SeamInfo[]> = {};
+    const newVal: BenchmarkValidation[] = [];
+    const newRedl: Record<string, { n: number; corr: number | null; mae: number | null }> = {};
 
     // Google Trends returns hourly data for windows ≤ 7 days, daily for longer.
     // For sub-daily frequencies over ranges > 7 days we use a sliding 7-day
@@ -1102,6 +1270,7 @@ export default function TrendPulse() {
     for (let ki = 0; ki < keywords.length; ki++) {
       const kw = keywords[ki];
       const allRows: TrendRow[] = [];
+      const winRows: TrendRow[][] = [];
 
       for (let wi = 0; wi < windows.length; wi++) {
         const { s, e } = windows[wi];
@@ -1111,18 +1280,48 @@ export default function TrendPulse() {
             : `Fetching "${kw}" (${ki + 1}/${keywords.length})…`
         );
         const raw = await fetchWindow(kw, s, e, geo);
-        if (raw) allRows.push(...raw.map((r) => ({ ...r, keyword: kw })));
+        if (raw) {
+          const m = raw.map((r) => ({ ...r, keyword: kw }));
+          allRows.push(...m);
+          winRows.push(m);
+        }
         // 600 ms between window calls to avoid hitting Google's rate limit
         if (wi < windows.length - 1) await new Promise((r) => setTimeout(r, 600));
       }
 
       if (allRows.length > 0) {
-        const base = windows.length > 1 ? mergeWindowRows(allRows) : allRows;
-        newData[kw] = resampleToFreq(base, freq);
+        let base: TrendRow[] = allRows;
+        if (windows.length > 1) {
+          const st = stitchWindows(winRows);
+          base = st.rows;
+          newSeams[kw] = st.seams;
+        }
+        const out = resampleToFreq(base, freq);
+        newData[kw] = out.map((r) => (categories[kw] ? { ...r, category: categories[kw] } : r));
+        newDiag.push(seriesDiagnostics(kw, base, out, freqMinutes(freq)));
+        newSparse.push(sparsityStats(kw, base.map((r) => r.hits)));
         realCount++;
+
+        // Independent checks (extra requests): daily benchmark and a repeat download of the first window
+        if (runValidation && freq !== "daily" && freq !== "weekly") {
+          setFetchProgress(`Validating "${kw}" against the daily series…`);
+          if (rangeMs > 7 * 86400000 && rangeMs <= 260 * 86400000) {
+            await new Promise((r) => setTimeout(r, 600));
+            const daily = await fetchWindow(kw, startISO, endISO, geo);
+            if (daily) {
+              newVal.push(validateAgainstDaily(kw, base, daily, newSeams[kw] ?? []));
+              newRes[kw] = { hourly: base, m30: resampleToFreq(base, "30min"), daily };
+            }
+          }
+          if (winRows[0]) {
+            await new Promise((r) => setTimeout(r, 600));
+            const again = await fetchWindow(kw, windows[0].s, windows[0].e, geo);
+            if (again) newRedl[kw] = redownloadAgreement(winRows[0], again as TrendRow[]);
+          }
+        }
       } else {
         // All windows failed — fall back to simulated data
-        newData[kw] = generateSimulatedData(kw, start, end, freq, geo);
+        newData[kw] = generateSimulatedData(kw, start, end, freq, geo).map((r) => ({ ...r, simulated: true, category: categories[kw] }));
         simCount++;
       }
 
@@ -1135,13 +1334,14 @@ export default function TrendPulse() {
       simCount > 0 && realCount === 0 ? "simulated" : "mixed";
 
     setDataByKeyword(newData);
+    setResData(newRes); setDiagnostics(newDiag); setSparsity(newSparse); setSeamsByKw(newSeams); setValidation(newVal); setRedownload(newRedl);
     setDataSource(source);
     setFetchProgress("");
     setLoading(false);
     setFetched(true);
     setPage(0);
     setActiveTab("chart");
-  }, [keywords, days, dateMode, startDate, endDate, freq, geo]);
+  }, [keywords, days, dateMode, startDate, endDate, freq, geo, categories, runValidation]);
 
   /* ── Save / Load / Delete analyses ── */
   const handleSave = useCallback(() => {
@@ -1198,27 +1398,33 @@ export default function TrendPulse() {
     });
   }, []);
 
-  /* ── Bulk / file keyword import ── */
+  /* ── Bulk / file / preset keyword import (with optional category column) ── */
+  const importEntries = useCallback((entries: KeywordEntry[]) => {
+    const fresh = entries.filter((e) => !keywords.includes(e.keyword)).slice(0, MAX_KEYWORDS - keywords.length);
+    if (fresh.length) setKeywords((prev) => [...prev, ...fresh.map((e) => e.keyword)].slice(0, MAX_KEYWORDS));
+    setCategories((prev) => {
+      const next = { ...prev };
+      for (const e of entries) if (e.category && (keywords.includes(e.keyword) || fresh.includes(e))) next[e.keyword] = e.category;
+      return next;
+    });
+  }, [keywords]);
+
   const handleBulkAdd = useCallback(() => {
-    const toAdd = parseBulkKeywords(bulkText, keywords);
-    if (!toAdd.length) return;
-    setKeywords((prev) => [...prev, ...toAdd].slice(0, MAX_KEYWORDS));
+    const entries = parseKeywordEntries(bulkText);
+    if (!entries.length) return;
+    importEntries(entries);
     setBulkText("");
     setShowBulkInput(false);
-  }, [bulkText, keywords]);
+  }, [bulkText, importEntries]);
 
   const handleFileImport = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => {
-      const text = (ev.target?.result as string) ?? "";
-      const toAdd = parseBulkKeywords(text, keywords);
-      if (toAdd.length) setKeywords((prev) => [...prev, ...toAdd].slice(0, MAX_KEYWORDS));
-    };
+    reader.onload = (ev) => importEntries(parseKeywordEntries((ev.target?.result as string) ?? ""));
     reader.readAsText(file);
     e.target.value = ""; // reset so the same file can be re-imported
-  }, [keywords]);
+  }, [importEntries]);
 
   /* ── Derived data ── */
   const flatData = useMemo(
@@ -1340,9 +1546,9 @@ export default function TrendPulse() {
 
   /* ── Exports ── */
   const exportCSV = () => {
-    const header = "keyword,datetime,date,time,year,month,day,hour,minute,dow,dow_name,quarter,weekend,hits\n";
+    const header = "keyword,datetime,date,time,year,month,day,hour,minute,dow,dow_name,quarter,weekend,hits,category,interpolated,simulated\n";
     const rows = flatData.map((r) =>
-      `${r.keyword},${r.datetime},${r.date},${r.time},${r.year},${r.month},${r.day},${r.hour},${r.minute},${r.dow},${r.dowName},${r.quarter},${r.weekend ? 1 : 0},${r.hits}`
+      `${r.keyword},${r.datetime},${r.date},${r.time},${r.year},${r.month},${r.day},${r.hour},${r.minute},${r.dow},${r.dowName},${r.quarter},${r.weekend ? 1 : 0},${r.hits},"${r.category ?? ""}",${r.interpolated ? 1 : 0},${r.simulated ? 1 : 0}`
     ).join("\n");
     saveAs(new Blob([header + rows], { type: "text/csv;charset=utf-8" }), `${fileBase(keywords)}_trends.csv`);
   };
@@ -1356,12 +1562,39 @@ export default function TrendPulse() {
     saveAs(new Blob([header + rows], { type: "text/csv;charset=utf-8" }), `${fileBase(keywords)}_gt_sentiment.csv`);
   };
 
+  const diagnosticsRows = () => diagnostics.map((d) => ({
+    keyword: d.keyword, category: categories[d.keyword] ?? "",
+    native_step_min: d.nativeStepMin, output_step_min: d.outputStepMin, rows_per_native_obs: d.inflationFactor,
+    n_native: d.nNative, n_output: d.nOutput,
+    identical_consecutive_native: d.identicalNative, identical_consecutive_output: d.identicalOutput,
+    acf1_native: d.acf1Native ?? "", acf1_output: d.acf1Output ?? "",
+    n_eff_native_ar1: d.nEffNative, n_eff_output_ar1: d.nEffOutput, oversampled: d.oversampled ? 1 : 0,
+    daily_corr_levels: validation.find((v) => v.keyword === d.keyword)?.corrLevels ?? "",
+    daily_corr_changes: validation.find((v) => v.keyword === d.keyword)?.corrDiffs ?? "",
+    daily_screen: validation.find((v) => v.keyword === d.keyword)?.verdict ?? "",
+    redownload_corr: redownload[d.keyword]?.corr ?? "",
+    zero_share: sparsity.find((q) => q.keyword === d.keyword)?.zeroShare ?? "",
+    share_at_or_below_5: sparsity.find((q) => q.keyword === d.keyword)?.lowShare ?? "",
+    longest_zero_run: sparsity.find((q) => q.keyword === d.keyword)?.maxZeroRun ?? "",
+    coef_of_variation: sparsity.find((q) => q.keyword === d.keyword)?.cv ?? "",
+    sparsity_flag: sparsity.find((q) => q.keyword === d.keyword)?.flag ?? "",
+  }));
+
+  const exportDiagnosticsCSV = () => {
+    const rows = diagnosticsRows();
+    if (!rows.length) return;
+    const cols = Object.keys(rows[0]);
+    const body = rows.map((r) => cols.map((c) => JSON.stringify((r as Record<string, unknown>)[c] ?? "")).join(",")).join("\n");
+    saveAs(new Blob([cols.join(",") + "\n" + body], { type: "text/csv;charset=utf-8" }), `${fileBase(keywords)}_diagnostics.csv`);
+  };
+
   const exportExcel = () => {
     const wb = XLSX.utils.book_new();
     const toRow = (r: TrendRow) => ({
       keyword: r.keyword, datetime: r.datetime, date: r.date, time: r.time,
       year: r.year, month: r.month, day: r.day, hour: r.hour, minute: r.minute,
       dow: r.dow, dow_name: r.dowName, quarter: r.quarter, weekend: r.weekend ? 1 : 0, hits: r.hits,
+      category: r.category ?? "", interpolated: r.interpolated ? 1 : 0, simulated: r.simulated ? 1 : 0,
     });
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(flatData.map(toRow)), "Combined");
     for (const [kw, rows] of Object.entries(dataByKeyword)) {
@@ -1396,6 +1629,20 @@ export default function TrendPulse() {
         return row;
       });
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(loadingRows), "PCA Loadings");
+      if (pcaResult.labels.some((k) => categories[k])) {
+        const catRows = [true, false].flatMap((t) =>
+          componentShareByCategory(pcaResult.labels, pcaResult.loadings[0], categories, t).map((r) => ({
+            level: t ? "top-level" : "full", group: r.group, n_keywords: r.nKeywords,
+            pc1_share: r.share, equal_weight_share: r.equalWeight, mean_abs_loading: r.meanAbsLoading,
+          })));
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(catRows), "PC1 by category");
+      }
+    }
+    if (diagnostics.length) {
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(diagnosticsRows()), "Diagnostics");
+      const seamRows = Object.entries(seamsByKw).flatMap(([kw, ss]) => ss.map((x) => ({ keyword: kw, window: x.window, overlap_n: x.overlapN, scale: x.scale, cumulative_scale: x.cumulativeScale, overlap_corr: x.overlapCorr ?? "", flag: x.flag ?? "" })));
+      if (seamRows.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(seamRows), "Seams");
+      if (validation.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(validation), "Daily benchmark");
     }
     XLSX.writeFile(wb, `${fileBase(keywords)}_trends.xlsx`);
   };
@@ -1411,7 +1658,7 @@ export default function TrendPulse() {
 
   const exportRScript = () => {
     const { start, end } = effectiveRange(dateMode, days, startDate, endDate);
-    const script = generateRScript(keywords, toISODate(start), toISODate(end), freq, geo);
+    const script = generateRScript(keywords, toISODate(start), toISODate(end), freq, geo, categories);
     saveAs(new Blob([script], { type: "text/plain;charset=utf-8" }), `${fileBase(keywords)}_trends.R`);
   };
 
@@ -1470,7 +1717,7 @@ export default function TrendPulse() {
             </div>
             <div>
               <h1 className="text-lg font-bold tracking-tight">Trend Pulse</h1>
-              <p className="text-[11px] text-[var(--text-muted)] tracking-wide uppercase">Sub-hourly Google Trends</p>
+              <p className="text-[11px] text-[var(--text-muted)] tracking-wide uppercase">Google Trends · native hourly + diagnostics</p>
             </div>
           </div>
           <div className="flex items-center gap-3">
@@ -1525,6 +1772,7 @@ export default function TrendPulse() {
                       style={{ background: KW_COLORS[i] + "22", color: KW_COLORS[i], border: `1px solid ${KW_COLORS[i]}55` }}
                     >
                       {kw}
+                      {categories[kw] && <span className="opacity-60 text-[10px]">· {categories[kw]}</span>}
                       <button
                         onClick={() => removeKeyword(kw)}
                         className="ml-0.5 hover:opacity-60 transition-opacity font-bold leading-none"
@@ -1588,8 +1836,30 @@ export default function TrendPulse() {
                   onChange={handleFileImport}
                 />
                 <span className="ml-auto text-[10px] text-[var(--text-muted)]">
-                  .txt · .csv · comma or newline separated
+                  .txt · .csv · keyword,category · comma or newline separated
                 </span>
+              </div>
+
+              {/* Presets */}
+              <div className="flex flex-wrap items-center gap-2 mt-2">
+                {KEYWORD_PRESETS.map((p) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() => importEntries(p.entries)}
+                    disabled={keywords.length >= MAX_KEYWORDS}
+                    className="px-3 py-1.5 rounded-lg text-[11px] font-medium border border-[var(--accent)]/40 text-[var(--accent)] hover:bg-[var(--accent)]/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    🚢 {p.label}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => saveAs(new Blob([entriesToCSV(HORMUZ_TABLE2)], { type: "text/csv;charset=utf-8" }), "hormuz_keywords_table2.csv")}
+                  className="px-3 py-1.5 rounded-lg text-[11px] font-medium border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
+                >
+                  ⬇ Table 2 keyword file
+                </button>
               </div>
 
               {/* Bulk textarea */}
@@ -1682,8 +1952,14 @@ export default function TrendPulse() {
               <label className="block text-[11px] uppercase tracking-widest text-[var(--text-muted)] mb-2 font-semibold">Frequency</label>
               <select value={freq} onChange={(e) => setFreq(e.target.value as Frequency)}
                 className="w-full px-4 py-3 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] transition-colors cursor-pointer">
-                {FREQ_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                {FREQ_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}{o.value === "1hour" ? " (native)" : ""}</option>)}
               </select>
+              {freqMinutes(freq) < 60 && (
+                <p className="mt-2 text-[10px] leading-relaxed text-amber-400">
+                  ⚠ Google Trends is about hourly at best. A {freq} grid repeats or interpolates hourly values, adds no
+                  information and inflates autocorrelation and Granger-test significance. Use 1 hour for inference.
+                </p>
+              )}
             </div>
 
             {/* Region */}
@@ -1698,7 +1974,11 @@ export default function TrendPulse() {
           </div>
 
           {/* Fetch button */}
-          <div className="mt-4">
+          <label className="mt-4 flex items-start gap-2 text-[11px] text-[var(--text-muted)] cursor-pointer">
+            <input type="checkbox" checked={runValidation} onChange={(e) => setRunValidation(e.target.checked)} className="mt-0.5" />
+            <span>Validate stitching and compare 30-min, hourly and daily series (2 extra requests per keyword; slower).</span>
+          </label>
+          <div className="mt-3">
             <button
               onClick={handleFetch}
               disabled={loading || !keywords.length}
@@ -1887,6 +2167,8 @@ export default function TrendPulse() {
               </div>
             )}
 
+            <DiagnosticsPanel diag={diagnostics} seams={seamsByKw} validation={validation} redownload={redownload} sparsity={sparsity} />
+
             {/* Descriptive stats panel */}
             <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5">
               <div className="text-[11px] uppercase tracking-widest text-[var(--text-muted)] mb-4 font-semibold">
@@ -1973,6 +2255,7 @@ export default function TrendPulse() {
                 { key: "chart" as const, label: "Chart", icon: "📈" },
                 { key: "table" as const, label: "Data Table", icon: "📊" },
                 ...(keywords.length >= 2 ? [{ key: "pca" as const, label: "PCA", icon: "🔬" }] : []),
+                ...(diagnostics.length ? [{ key: "resolution" as const, label: "Resolutions", icon: "🔀" }] : []),
                 { key: "exports" as const, label: "Exports", icon: "📦" },
               ]).map((tab) => (
                 <button key={tab.key} onClick={() => setActiveTab(tab.key)}
@@ -2234,6 +2517,52 @@ export default function TrendPulse() {
                   ))}
                 </div>
 
+                {/* PC1 composition by query category */}
+                {(() => {
+                  const hasCat = pcaResult.labels.some((k) => categories[k]);
+                  if (!hasCat) return null;
+                  const pc1 = pcaResult.loadings[0];
+                  const top = componentShareByCategory(pcaResult.labels, pc1, categories, true);
+                  const full = componentShareByCategory(pcaResult.labels, pc1, categories, false);
+                  const th2 = "px-3 py-2 text-left font-semibold text-[var(--text-muted)] uppercase tracking-wider text-[10px]";
+                  const td2 = "px-3 py-2 font-mono text-[var(--text-secondary)]";
+                  const Tbl = ({ rows, title }: { rows: typeof top; title: string }) => (
+                    <div className="overflow-x-auto">
+                      <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] mb-1 font-semibold">{title}</div>
+                      <table className="w-full text-xs">
+                        <thead><tr className="border-b border-[var(--border)]">
+                          <th className={th2}>Group</th><th className={th2}>Keywords</th><th className={th2}>Share of PC1 (sum of squared loadings)</th>
+                          <th className={th2}>Equal-weight share</th><th className={th2}>Mean |loading|</th>
+                        </tr></thead>
+                        <tbody>
+                          {rows.map((r) => (
+                            <tr key={r.group} className="border-b border-[var(--border)]/50">
+                              <td className="px-3 py-2 text-[var(--text-primary)]">{r.group}</td>
+                              <td className={td2}>{r.nKeywords}</td><td className={td2}>{(r.share * 100).toFixed(1)}%</td>
+                              <td className={td2}>{(r.equalWeight * 100).toFixed(1)}%</td><td className={td2}>{r.meanAbsLoading.toFixed(3)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  );
+                  return (
+                    <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-6 space-y-4">
+                      <div className="text-[11px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">
+                        What drives PC1? Composition by query category
+                      </div>
+                      <Tbl rows={top} title="By top-level category" />
+                      <Tbl rows={full} title="By full category" />
+                      <p className="text-[10px] text-[var(--text-muted)] leading-relaxed">
+                        A group whose share is well above its equal-weight share dominates the component. Compare generic
+                        geographic queries with commercial shipping queries to see whether the index reflects general
+                        attention or trade-specific concern. Loadings describe the PCA fit and do not by themselves show
+                        which queries investors act on.
+                      </p>
+                    </div>
+                  );
+                })()}
+
                 {/* Scree plot */}
                 <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-6">
                   <div className="flex items-center justify-between mb-1">
@@ -2414,6 +2743,8 @@ export default function TrendPulse() {
             )}
 
             {/* Exports tab */}
+            {activeTab === "resolution" && <ResolutionComparison data={resData} keywords={keywords} />}
+
             {activeTab === "exports" && (
               <div className="animate-fade-in-up grid grid-cols-1 md:grid-cols-2 gap-4" style={{ animationDelay: "80ms" }}>
                 {[
@@ -2422,6 +2753,7 @@ export default function TrendPulse() {
                   { title: "R Script", desc: `gtrendsR loop for all ${keywords.length} keyword${keywords.length > 1 ? "s" : ""} — writes intraday (${freq}) + daily CSVs per keyword plus combined daily.`, icon: "📐", ext: ".R", handler: exportRScript, color: "#2196F3" },
                   { title: "Stata", desc: "CSV + .do file with tsset, moving averages, and plots (first keyword).", icon: "📈", ext: ".do + .csv", handler: exportStata, color: "#FF9800" },
                   { title: "Word Report", desc: `Full .docx report: ${keywords.length} keyword${keywords.length > 1 ? "s" : ""}, collection process, timeline, per-keyword stats (mean, median, variance, skewness, kurtosis), and cutoff comparison if set.`, icon: "📝", ext: ".docx", handler: exportDocx, color: "#2B579A" },
+                  ...(diagnostics.length ? [{ title: "Diagnostics", desc: "Native vs output resolution, duplicated-value share, lag-1 autocorrelation, effective N, window seams and daily-benchmark checks, per keyword.", icon: "🧪", ext: ".csv", handler: exportDiagnosticsCSV, color: "#FBBF24" }] : []),
                   ...(pcaResult ? [{ title: "PCA Scores", desc: `PC scores time series — ${pcaResult.nVars} components × ${pcaResult.nObs.toLocaleString()} observations. PC1 explains ${(pcaResult.explainedVar[0] * 100).toFixed(1)}% of variance.`, icon: "🔬", ext: ".csv", handler: exportPCAcsv, color: "var(--accent-secondary)" }] : []),
                   ...(gtSentiment ? [{ title: "GT Sentiment", desc: `Google Trends Sentiment Index — PC1 normalized 0–100. Mean: ${gtSentiment.mean.toFixed(1)} · Positive: ${gtSentiment.pctPositive.toFixed(1)}% · Negative: ${(100 - gtSentiment.pctPositive).toFixed(1)}%.`, icon: "📡", ext: ".csv", handler: exportGTSentimentCSV, color: "var(--accent)" }] : []),
                 ].map((exp) => (

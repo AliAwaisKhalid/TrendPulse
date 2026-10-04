@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Trend Pulse — Sub-Hourly Google Trends",
+  title: "Trend Pulse — Google Trends with Diagnostics",
   description:
-    "Fetch Google Trends data at 30-minute resolution over 90 days. Export to CSV, Excel, Stata, and R.",
+    "Fetch Google Trends data at its native hourly resolution, with diagnostics for duplication, window stitching and sparsity. Export to CSV, Excel, Stata, and R.",
 };
 
 export default function RootLayout({
