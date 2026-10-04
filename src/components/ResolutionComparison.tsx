@@ -7,7 +7,7 @@ import {
 import { saveAs } from "file-saver";
 import { compareResolutions, type RowLike, type CI } from "@/lib/diagnostics";
 
-export interface ResolutionData { hourly: RowLike[]; m30: RowLike[]; daily: RowLike[] }
+export interface ResolutionData { hourly: RowLike[]; m30: RowLike[]; daily: RowLike[]; anchored?: boolean }
 
 const f2 = (v: number | null | undefined) => (v === null || v === undefined || !Number.isFinite(v) ? "n/a" : v.toFixed(3));
 const ci = (c: CI | null) => (c ? `[${c[0].toFixed(3)}, ${c[1].toFixed(3)}]` : "n/a");
@@ -62,6 +62,11 @@ export default function ResolutionComparison({ data, keywords }: { data: Record<
           </button>
         </div>
 
+        {data[cur]?.anchored && (
+          <p className="text-[11px] text-amber-400 leading-relaxed">
+            This series was anchored to the daily benchmark, so its agreement with the daily series is partly by construction and is not an independent check.
+          </p>
+        )}
         <div className="overflow-x-auto">
           <table className="w-full text-xs">
             <thead><tr className="border-b border-[var(--border)]">

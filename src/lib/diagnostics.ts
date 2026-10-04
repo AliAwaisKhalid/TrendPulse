@@ -132,10 +132,59 @@ export function seriesDiagnostics(
 export interface SeamInfo {
   window: number;          // index of the later window (>= 1)
   overlapN: number;
-  scale: number;           // multiplicative factor applied to the later window
-  cumulativeScale: number; // factor mapping this window onto window 0's scale (the overlap is already in that frame)
+  scale: number;           // multiplicative factor applied to the later window (maps raw window values onto window 0's frame)
+  cumulativeScale: number; // same factor: the overlap is already in window 0's frame, so scales do not compound
   overlapCorr: number | null;
+  /**
+   * Lower bound on the relative uncertainty of the scale from integer rounding alone
+   * (each index value is rounded to an integer; sd of the rounding error is about 0.29).
+   * Google's sampling noise comes on top of this.
+   */
+  relErr: number | null;
   flag: string | null;
+}
+
+export interface WindowAnchor {
+  window: number;
+  days: number;               // full days used to estimate the factor
+  factor: number | null;      // multiplier onto the daily benchmark's units (null: not estimable)
+  chainScale: number;
+  ratio: number | null;       // (anchored level) / (chain level), both normalised to a maximum of 100
+  usedAnchor: boolean;
+  allZero: boolean;
+}
+
+export interface AnchorInfo {
+  requested: boolean;
+  usedWindows: number;
+  fallbackWindows: number;    // windows with signal but too little benchmark information
+  corrWithChain: number | null;
+  maxRatio: number | null;    // largest of ratio and 1/ratio over anchored windows
+  windows: WindowAnchor[];
+}
+
+export interface StitchResult<T> {
+  rows: T[];        // selected series (anchored when anchoring was requested and possible, otherwise chain)
+  chainRows: T[];   // chain-rescaled series, independent of the daily benchmark
+  seams: SeamInfo[];
+  anchored: boolean;
+  anchor: AnchorInfo;
+}
+
+function assemble<T extends RowLike>(ws: T[][], scales: number[]): { rows: T[]; mx: number } {
+  const aligned = new Map<string, { sum: number; n: number; row: T }>();
+  ws.forEach((w, k) => {
+    for (const r of w) {
+      const v = r.hits * scales[k];
+      const ex = aligned.get(r.datetime);
+      if (ex) { ex.sum += v; ex.n++; } else aligned.set(r.datetime, { sum: v, n: 1, row: { ...r } });
+    }
+  });
+  const merged = [...aligned.values()]
+    .sort((a, b) => a.row.datetime.localeCompare(b.row.datetime))
+    .map(({ sum, n, row }) => ({ ...row, hits: sum / n }));
+  const mx = Math.max(...merged.map((r) => r.hits), 1e-9);
+  return { rows: merged.map((r) => ({ ...r, hits: Math.round((r.hits / mx) * 1000) / 10 })), mx };
 }
 
 /**
@@ -143,12 +192,26 @@ export interface SeamInfo {
  * observations, then renormalise the whole series to a 0-100 maximum.
  * Each seam is reported so the stitching can be audited; nothing here proves
  * the result is correct, which is what validateAgainstDaily is for.
+ *
+ * Optional anchoring: when a daily benchmark is supplied and anchor is true, each window's
+ * level is instead estimated from its full days against the daily series (least squares through
+ * the origin), so one noisy overlap cannot set the level of every later window. Windows without
+ * enough benchmark information (fewer than 3 full days with signal) keep their chain scale,
+ * converted to the benchmark's units. The chain series is always returned as well so the two can
+ * be compared, and the validation against the daily series should use chainRows (anchored levels
+ * agree with the daily series by construction).
  */
-export function stitchWindows<T extends RowLike>(windows: T[][]): { rows: T[]; seams: SeamInfo[] } {
+export function stitchWindows<T extends RowLike>(
+  windows: T[][], opts?: { daily?: RowLike[]; anchor?: boolean }
+): StitchResult<T> {
   const ws = windows.filter((w) => w.length);
-  if (!ws.length) return { rows: [], seams: [] };
-  const aligned = new Map<string, { sum: number; n: number; row: T }>();
+  const emptyAnchor: AnchorInfo = { requested: !!opts?.anchor, usedWindows: 0, fallbackWindows: 0, corrWithChain: null, maxRatio: null, windows: [] };
+  if (!ws.length) return { rows: [], chainRows: [], seams: [], anchored: false, anchor: emptyAnchor };
+
+  // 1. Chain scales
+  const aligned = new Map<string, { sum: number; n: number }>();
   const seams: SeamInfo[] = [];
+  const scales: number[] = [];
   ws.forEach((w, k) => {
     let scale = 1;
     if (k > 0) {
@@ -156,31 +219,73 @@ export function stitchWindows<T extends RowLike>(windows: T[][]): { rows: T[]; s
       const prevSum = ov.reduce((s, r) => { const a = aligned.get(r.datetime)!; return s + a.sum / a.n; }, 0);
       const curSum = ov.reduce((s, r) => s + r.hits, 0);
       let flag: string | null = null;
+      let relErr: number | null = null;
       if (ov.length < 2) { flag = "overlap shorter than 2 observations"; }
       else if (curSum <= 0 || prevSum <= 0) { flag = "zero overlap signal; scale set to 1"; }
       else {
         scale = prevSum / curSum;
+        relErr = (0.41 * Math.sqrt(ov.length)) / curSum;
         if (Math.min(prevSum, curSum) < 20) flag = "very low overlap signal; scale unreliable";
         else if (scale > 5 || scale < 0.2) flag = "extreme scale factor";
+        if (relErr > 0.25) flag = (flag ? flag + "; " : "") + "rounding error alone is at least 25% of the scale";
       }
       const corr = pearson(
         ov.map((r) => r.hits),
         ov.map((r) => { const a = aligned.get(r.datetime)!; return a.sum / a.n; })
       );
-      seams.push({ window: k, overlapN: ov.length, scale, cumulativeScale: scale, overlapCorr: corr, flag });
+      seams.push({ window: k, overlapN: ov.length, scale, cumulativeScale: scale, overlapCorr: corr, relErr, flag });
     }
+    scales.push(scale);
     for (const r of w) {
       const v = r.hits * scale;
       const ex = aligned.get(r.datetime);
-      if (ex) { ex.sum += v; ex.n++; } else aligned.set(r.datetime, { sum: v, n: 1, row: { ...r } });
+      if (ex) { ex.sum += v; ex.n++; } else aligned.set(r.datetime, { sum: v, n: 1 });
     }
   });
+  const chain = assemble(ws, scales);
 
-  const merged = [...aligned.values()]
-    .sort((a, b) => a.row.datetime.localeCompare(b.row.datetime))
-    .map(({ sum, n, row }) => ({ ...row, hits: sum / n }));
-  const mx = Math.max(...merged.map((r) => r.hits), 1e-9);
-  return { rows: merged.map((r) => ({ ...r, hits: Math.round((r.hits / mx) * 1000) / 10 })), seams };
+  // 2. Optional anchoring to the daily benchmark
+  const daily = opts?.daily;
+  if (!opts?.anchor || !daily || !daily.length) {
+    return { rows: chain.rows, chainRows: chain.rows, seams, anchored: false, anchor: emptyAnchor };
+  }
+  const dd = new Map(daily.map((r) => [r.date, r.hits] as const));
+  const info: WindowAnchor[] = ws.map((w, k) => {
+    const byDay = new Map<string, number[]>();
+    for (const r of w) { const a = byDay.get(r.date) ?? []; a.push(r.hits); byDay.set(r.date, a); }
+    let sxy = 0, sxx = 0, days = 0;
+    for (const [d, a] of byDay) {
+      if (a.length < 20 || !dd.has(d)) continue;
+      const m = mean(a);
+      sxy += m * dd.get(d)!; sxx += m * m; days++;
+    }
+    const allZero = w.every((r) => r.hits === 0);
+    const ok = days >= 3 && sxx > 0;
+    return { window: k, days, factor: ok ? sxy / sxx : null, chainScale: scales[k], ratio: null, usedAnchor: ok, allZero };
+  });
+  const ratios = info.filter((x) => x.factor !== null && x.factor > 0).map((x) => x.factor! / x.chainScale).sort((a, b) => a - b);
+  if (!ratios.length) {
+    return { rows: chain.rows, chainRows: chain.rows, seams, anchored: false, anchor: { ...emptyAnchor, fallbackWindows: info.filter((x) => !x.allZero).length, windows: info } };
+  }
+  const g = ratios[Math.floor(ratios.length / 2)]; // median frame ratio, used for fallback windows
+  const aScales = info.map((x) => (x.factor !== null && x.factor > 0 ? x.factor : x.chainScale * g));
+  const anch = assemble(ws, aScales);
+  info.forEach((x, k) => { x.ratio = x.usedAnchor ? (aScales[k] / anch.mx) / (scales[k] / chain.mx) : null; });
+  const cm = new Map(chain.rows.map((r) => [r.datetime, r.hits] as const));
+  const xa: number[] = [], xc: number[] = [];
+  for (const r of anch.rows) { const c = cm.get(r.datetime); if (c !== undefined) { xa.push(r.hits); xc.push(c); } }
+  const rr = info.filter((x) => x.ratio !== null && x.ratio > 0).map((x) => Math.max(x.ratio!, 1 / x.ratio!));
+  return {
+    rows: anch.rows, chainRows: chain.rows, seams, anchored: true,
+    anchor: {
+      requested: true,
+      usedWindows: info.filter((x) => x.usedAnchor).length,
+      fallbackWindows: info.filter((x) => !x.usedAnchor && !x.allZero).length,
+      corrWithChain: pearson(xa, xc),
+      maxRatio: rr.length ? Math.max(...rr) : null,
+      windows: info,
+    },
+  };
 }
 
 /* ───────────── Validation against an independent benchmark ───────────── */

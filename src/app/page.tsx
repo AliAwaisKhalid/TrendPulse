@@ -24,7 +24,7 @@ import {
   stitchWindows, seriesDiagnostics, validateAgainstDaily, redownloadAgreement,
   sparsityStats, componentShareByCategory,
   nativeStepMinutes,
-  type SeriesDiagnostics, type SeamInfo, type BenchmarkValidation, type SparsityStats,
+  type SeriesDiagnostics, type SeamInfo, type AnchorInfo, type BenchmarkValidation, type SparsityStats,
 } from "@/lib/diagnostics";
 import ResolutionComparison, { type ResolutionData } from "@/components/ResolutionComparison";
 import {
@@ -997,8 +997,9 @@ function parseBulkKeywords(text: string, existing: string[]): string[] {
 const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
 const f2 = (v: number | null | undefined) => (v === null || v === undefined || !Number.isFinite(v) ? "n/a" : v.toFixed(2));
 
-function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windowDesc }: {
+function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windowDesc, anchors }: {
   windowDesc: string;
+  anchors: Record<string, AnchorInfo>;
   diag: SeriesDiagnostics[];
   sparsity: SparsityStats[];
   seams: Record<string, SeamInfo[]>;
@@ -1087,6 +1088,7 @@ function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windo
               <thead><tr className="border-b border-[var(--border)]">
                 <th className={th}>Keyword</th><th className={th}>Seams</th><th className={th}>Flagged</th>
                 <th className={th}>Cumulative scale at end</th><th className={th}>Min overlap corr.</th>
+                <th className={th}>Seams with rounding error of at least 25%</th>
               </tr></thead>
               <tbody>
                 {Object.entries(seams).map(([kw, ss]) => {
@@ -1098,12 +1100,45 @@ function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windo
                       <td className={td} style={{ color: ss.some((x) => x.flag) ? "#fbbf24" : undefined }}>{ss.filter((x) => x.flag).length}</td>
                       <td className={td}>{ss.length ? ss[ss.length - 1].cumulativeScale.toFixed(2) : "n/a"}</td>
                       <td className={td}>{corrs.length ? f2(Math.min(...corrs)) : "n/a"}</td>
+                      <td className={td}>{ss.filter((x) => x.relErr !== null && x.relErr >= 0.25).length}</td>
                     </tr>
                   );
                 })}
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+      {Object.keys(anchors).length > 0 && (
+        <div className="space-y-2">
+          <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">
+            Chain rescaling versus anchoring each window to the daily benchmark
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead><tr className="border-b border-[var(--border)]">
+                <th className={th}>Keyword</th><th className={th}>Anchored windows</th><th className={th}>Windows with signal but too little benchmark information</th>
+                <th className={th}>Corr. of the two series (levels)</th><th className={th}>Largest window level ratio (anchor vs chain)</th>
+              </tr></thead>
+              <tbody>
+                {Object.entries(anchors).map(([kw, a]) => (
+                  <tr key={kw} className="border-b border-[var(--border)]/50">
+                    <td className="px-3 py-2 text-[var(--text-primary)]">{kw}</td>
+                    <td className={td}>{a.requested ? a.usedWindows : "not requested"}</td>
+                    <td className={td}>{a.requested ? a.fallbackWindows : "n/a"}</td>
+                    <td className={td}>{f2(a.corrWithChain)}</td>
+                    <td className={td} style={{ color: a.maxRatio !== null && a.maxRatio > 1.5 ? "#fbbf24" : undefined }}>{a.maxRatio !== null ? a.maxRatio.toFixed(2) : "n/a"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-[10px] text-[var(--text-muted)] leading-relaxed">
+            Anchoring estimates each window&apos;s level from its full days against the daily series, so a single noisy overlap cannot set the level of every later window.
+            It is not automatically better: the daily series is itself a sample with integer rounding, and windows with almost no signal cannot be anchored.
+            A ratio far from 1 means the two methods disagree about that window&apos;s level and the result should be treated as uncertain.
+            The benchmark check below always uses the chain series, because anchored levels agree with the daily series by construction.
+          </p>
         </div>
       )}
       {validation.length > 0 && (
@@ -1205,6 +1240,8 @@ export default function TrendPulse() {
   const [dataSource, setDataSource] = useState<"real" | "simulated" | "mixed" | null>(null);
   const [fetchProgress, setFetchProgress] = useState<string>("");
   const [windowMode, setWindowMode] = useState<"hourly6" | "paper24">("hourly6");
+  const [stitchMode, setStitchMode] = useState<"chain" | "anchor">("chain");
+  const [anchorByKw, setAnchorByKw] = useState<Record<string, AnchorInfo>>({});
   const [windowDesc, setWindowDesc] = useState("");
   const [categories, setCategories] = useState<Record<string, string>>({});
   const [runValidation, setRunValidation] = useState(true);
@@ -1261,7 +1298,7 @@ export default function TrendPulse() {
     setFetched(false);
     setDataSource(null);
     setFetchProgress("");
-    setDiagnostics([]); setSparsity([]); setResData({}); setSeamsByKw({}); setValidation([]); setRedownload({});
+    setDiagnostics([]); setSparsity([]); setResData({}); setSeamsByKw({}); setValidation([]); setRedownload({}); setAnchorByKw({});
 
     const { start, end } = effectiveRange(dateMode, days, startDate, endDate);
     const startISO = toISODate(start);
@@ -1275,6 +1312,7 @@ export default function TrendPulse() {
     const newSeams: Record<string, SeamInfo[]> = {};
     const newVal: BenchmarkValidation[] = [];
     const newRedl: Record<string, { n: number; corr: number | null; mae: number | null }> = {};
+    const newAnchor: Record<string, AnchorInfo> = {};
 
     // Google returns hourly (or finer) points only for windows shorter than 7 days AND when the
     // request carries time-of-day boundaries; otherwise it returns daily points.
@@ -1315,6 +1353,7 @@ export default function TrendPulse() {
             : `${windows.length} windows of 6 days, 6 h overlap (hourly source points)`)
         : "single request"
     );
+    if (needsWindows && stitchMode === "anchor") setWindowDesc((d) => d + "; output anchored to the daily benchmark where possible (chain series kept for validation)");
 
     for (let ki = 0; ki < keywords.length; ki++) {
       const kw = keywords[ki];
@@ -1343,11 +1382,25 @@ export default function TrendPulse() {
       }
 
       if (allRows.length > 0) {
+        // The daily benchmark is fetched before stitching so that it can be used both as the
+        // independent check and, if requested, to anchor window levels.
+        const doValidate = runValidation && freq !== "daily" && freq !== "weekly";
+        let dailyRows: TrendRow[] | null = null;
+        if (doValidate && rangeMs > 7 * 86400000 && rangeMs <= 260 * 86400000) {
+          setFetchProgress(`Fetching the daily benchmark for "${kw}"…`);
+          await new Promise((r) => setTimeout(r, 600));
+          dailyRows = (await fetchWindow(kw, startISO, endISO, geo)) as TrendRow[] | null;
+        }
         let base: TrendRow[] = allRows;
+        let chainBase: TrendRow[] = allRows;
+        let anchoredOut = false;
         if (windows.length > 1) {
-          const st = stitchWindows(winRows);
+          const st = stitchWindows(winRows, { daily: dailyRows ?? undefined, anchor: stitchMode === "anchor" && !!dailyRows });
           base = st.rows;
+          chainBase = st.chainRows;
+          anchoredOut = st.anchored;
           newSeams[kw] = st.seams;
+          if (st.anchor.requested || dailyRows) newAnchor[kw] = st.anchor;
         }
         const rawStep = nativeStepMinutes(rawFirst);
         const out = resampleToFreq(base, freq);
@@ -1357,17 +1410,15 @@ export default function TrendPulse() {
         realCount++;
 
         // Independent checks (extra requests): daily benchmark and a repeat download of the first window
-        if (runValidation && freq !== "daily" && freq !== "weekly") {
+        if (doValidate) {
           setFetchProgress(`Validating "${kw}" against the daily series…`);
-          if (rangeMs > 7 * 86400000 && rangeMs <= 260 * 86400000) {
-            await new Promise((r) => setTimeout(r, 600));
-            const daily = await fetchWindow(kw, startISO, endISO, geo);
-            if (daily) {
-              newVal.push(validateAgainstDaily(kw, base, daily, newSeams[kw] ?? []));
-              newRes[kw] = windowMode === "paper24"
-                ? { hourly: binToGrid(base, 60), m30: base, daily }
-                : { hourly: base, m30: resampleToFreq(base, "30min"), daily };
-            }
+          if (dailyRows) {
+            const daily = dailyRows;
+            // The independent check uses the chain series: anchored levels agree with the daily series by construction.
+            newVal.push(validateAgainstDaily(kw, chainBase, daily, newSeams[kw] ?? []));
+            newRes[kw] = windowMode === "paper24"
+              ? { hourly: binToGrid(base, 60), m30: base, daily, anchored: anchoredOut }
+              : { hourly: base, m30: resampleToFreq(base, "30min"), daily, anchored: anchoredOut };
           }
           if (winRows[0]) {
             await new Promise((r) => setTimeout(r, 600));
@@ -1390,14 +1441,14 @@ export default function TrendPulse() {
       simCount > 0 && realCount === 0 ? "simulated" : "mixed";
 
     setDataByKeyword(newData);
-    setResData(newRes); setDiagnostics(newDiag); setSparsity(newSparse); setSeamsByKw(newSeams); setValidation(newVal); setRedownload(newRedl);
+    setResData(newRes); setDiagnostics(newDiag); setSparsity(newSparse); setSeamsByKw(newSeams); setValidation(newVal); setRedownload(newRedl); setAnchorByKw(newAnchor);
     setDataSource(source);
     setFetchProgress("");
     setLoading(false);
     setFetched(true);
     setPage(0);
     setActiveTab("chart");
-  }, [keywords, days, dateMode, startDate, endDate, freq, geo, categories, runValidation, windowMode]);
+  }, [keywords, days, dateMode, startDate, endDate, freq, geo, categories, runValidation, windowMode, stitchMode]);
 
   /* ── Save / Load / Delete analyses ── */
   const handleSave = useCallback(() => {
@@ -1696,7 +1747,7 @@ export default function TrendPulse() {
     }
     if (diagnostics.length) {
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(diagnosticsRows()), "Diagnostics");
-      const seamRows = Object.entries(seamsByKw).flatMap(([kw, ss]) => ss.map((x) => ({ keyword: kw, window: x.window, overlap_n: x.overlapN, scale: x.scale, cumulative_scale: x.cumulativeScale, overlap_corr: x.overlapCorr ?? "", flag: x.flag ?? "" })));
+      const seamRows = Object.entries(seamsByKw).flatMap(([kw, ss]) => ss.map((x) => ({ keyword: kw, window: x.window, overlap_n: x.overlapN, scale: x.scale, cumulative_scale: x.cumulativeScale, overlap_corr: x.overlapCorr ?? "", rounding_rel_err: x.relErr ?? "", flag: x.flag ?? "" })));
       if (seamRows.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(seamRows), "Seams");
       if (validation.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(validation), "Daily benchmark");
     }
@@ -2038,6 +2089,14 @@ export default function TrendPulse() {
               <option value="paper24">24 h windows, 4 h overlap (manuscript design, about 8-min source; many requests)</option>
             </select>
           </div>
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
+            <span className="uppercase tracking-widest font-semibold">Output series</span>
+            <select value={stitchMode} onChange={(e) => setStitchMode(e.target.value as "chain" | "anchor")}
+              className="px-3 py-1.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-primary)] text-xs">
+              <option value="chain">Chain rescaling on 6 h overlaps (daily benchmark stays an independent check)</option>
+              <option value="anchor">Anchored to the daily benchmark (needs validation and 6-day windows; daily levels then agree by construction)</option>
+            </select>
+          </div>
           <label className="mt-3 flex items-start gap-2 text-[11px] text-[var(--text-muted)] cursor-pointer">
             <input type="checkbox" checked={runValidation} onChange={(e) => setRunValidation(e.target.checked)} className="mt-0.5" />
             <span>Validate stitching and compare 30-min, hourly and daily series (2 extra requests per keyword; slower).</span>
@@ -2231,7 +2290,7 @@ export default function TrendPulse() {
               </div>
             )}
 
-            <DiagnosticsPanel diag={diagnostics} seams={seamsByKw} validation={validation} redownload={redownload} sparsity={sparsity} windowDesc={windowDesc} />
+            <DiagnosticsPanel diag={diagnostics} seams={seamsByKw} validation={validation} redownload={redownload} sparsity={sparsity} windowDesc={windowDesc} anchors={anchorByKw} />
 
             {/* Descriptive stats panel */}
             <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5">

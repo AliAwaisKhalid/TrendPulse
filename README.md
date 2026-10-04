@@ -63,3 +63,12 @@ Deploy with `npx vercel --prod`, or push to a GitHub repository connected to Ver
 - Window length decides the native step: about 6 days gives hourly points; 1 to 2 days gives 8 to 16 minute points. The 24-hour window design of the manuscript therefore does not use an hourly source (select "24 h windows" in Window design to reproduce it; the app bins to a 30-minute grid and reports the native step).
 - The final window is anchored to the end of the range and has the full length. A shorter last window returned 16-minute points that did not align with the hourly grid, was never rescaled and distorted the end of the series (found in a run for 29 Dec 2025 to 26 Mar 2026).
 - Most Table 2 series are very sparse at hourly resolution (8 of 11 are more than 60% zero hours); correlations with the daily series are driven largely by one regime jump (around 1 March 2026). Use the "5% largest jumps dropped" column and the rolling 14-day correlation, not the full-sample level correlation, as evidence.
+
+## Window levels: chain rescaling versus anchoring
+
+Google Trends scales every request so that its own maximum is 100, so the level of each window has to be recovered when windows are stitched.
+
+- **Chain rescaling (default).** Each window is scaled to match the already aligned values on its 6-hour overlap. When a regime jump falls between windows and the earlier window is near zero, the overlap holds only a few integer index points; their rounding error alone can be 10 to 50% of the scale, and that factor carries into every later window. The Seams table reports a rounding-error lower bound per seam and flags seams where it is at least 25%.
+- **Anchored to the daily benchmark (option "Output series").** Each window's level is estimated from its full days against the standard daily series (least squares through the origin), so one noisy overlap cannot set the level of every later window. Windows without enough benchmark information (fewer than 3 full days with signal) keep their chain scale. Anchoring needs 6-day windows and the validation option; it is not available for the 24-hour design.
+- Anchored levels agree with the daily series by construction, so the benchmark check always uses the chain series, and the Resolutions tab says when the displayed series was anchored. The "Chain rescaling versus anchoring" table shows how far the two methods disagree.
+- On synthetic series with a regime jump, anchoring was sometimes more accurate and sometimes slightly worse than the chain; it is not a guaranteed improvement.
