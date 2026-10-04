@@ -23,6 +23,7 @@ import { saveAs } from "file-saver";
 import {
   stitchWindows, seriesDiagnostics, validateAgainstDaily, redownloadAgreement,
   sparsityStats, componentShareByCategory,
+  nativeStepMinutes,
   type SeriesDiagnostics, type SeamInfo, type BenchmarkValidation, type SparsityStats,
 } from "@/lib/diagnostics";
 import ResolutionComparison, { type ResolutionData } from "@/components/ResolutionComparison";
@@ -309,6 +310,32 @@ function resampleToFreq(rows: TrendRow[], freq: Frequency): TrendRow[] {
   return result;
 }
 
+/* ─────────── Grid binning ─────────── */
+/** Average rows into fixed-width bins aligned to the Unix epoch (genuine aggregation, not interpolation). */
+function binToGrid(rows: TrendRow[], stepMin: number): TrendRow[] {
+  if (!rows.length) return rows;
+  const stepMs = stepMin * 60000;
+  const g = new Map<number, number[]>();
+  for (const r of rows) {
+    const ts = new Date(`${r.date}T${r.time}:00Z`).getTime();
+    const k = Math.floor(ts / stepMs) * stepMs;
+    const a = g.get(k) ?? []; a.push(r.hits); g.set(k, a);
+  }
+  const keyword = rows[0].keyword;
+  return [...g.entries()].sort((a, b) => a[0] - b[0]).map(([ts, a]) => {
+    const dt = new Date(ts);
+    const dateStr = dt.toISOString().slice(0, 10), timeStr = dt.toISOString().slice(11, 16);
+    const dow = dt.getUTCDay();
+    return {
+      keyword, datetime: `${dateStr} ${timeStr}`, date: dateStr, time: timeStr,
+      year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate(),
+      hour: dt.getUTCHours(), minute: dt.getUTCMinutes(), dow, dowName: DOW_NAMES[dow],
+      quarter: Math.floor(dt.getUTCMonth() / 3) + 1, weekend: dow === 0 || dow === 6,
+      hits: a.reduce((x, y) => x + y, 0) / a.length,
+    } as TrendRow;
+  });
+}
+
 /* ─────────── Window Fetch Helpers ─────────── */
 /**
  * Fetch a single time window from the /api/trends route.
@@ -318,10 +345,13 @@ async function fetchWindow(
   kw: string,
   startISO: string,
   endISO: string,
-  geo: string
+  geo: string,
+  startTime?: string,
+  endTime?: string
 ): Promise<Omit<TrendRow, "keyword">[] | null> {
   try {
     const params = new URLSearchParams({ keyword: kw, startDate: startISO, endDate: endISO });
+    if (startTime && endTime) { params.set("startTime", startTime); params.set("endTime", endTime); }
     if (geo) params.set("geo", geo);
     const res = await fetch(`/api/trends?${params}`);
     if (!res.ok) return null;
@@ -967,7 +997,8 @@ function parseBulkKeywords(text: string, existing: string[]): string[] {
 const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
 const f2 = (v: number | null | undefined) => (v === null || v === undefined || !Number.isFinite(v) ? "n/a" : v.toFixed(2));
 
-function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity }: {
+function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windowDesc }: {
+  windowDesc: string;
   diag: SeriesDiagnostics[];
   sparsity: SparsityStats[];
   seams: Record<string, SeamInfo[]>;
@@ -1049,7 +1080,7 @@ function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity }: {
       {Object.keys(seams).length > 0 && (
         <div className="space-y-2">
           <div className="text-[10px] uppercase tracking-widest text-[var(--text-muted)] font-semibold">
-            Window stitching (7-day windows, 6-hour overlap, chained overlap rescaling)
+            Window stitching (chained overlap rescaling): {windowDesc}
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
@@ -1173,6 +1204,8 @@ export default function TrendPulse() {
   const [fetched, setFetched] = useState(false);
   const [dataSource, setDataSource] = useState<"real" | "simulated" | "mixed" | null>(null);
   const [fetchProgress, setFetchProgress] = useState<string>("");
+  const [windowMode, setWindowMode] = useState<"hourly6" | "paper24">("hourly6");
+  const [windowDesc, setWindowDesc] = useState("");
   const [categories, setCategories] = useState<Record<string, string>>({});
   const [runValidation, setRunValidation] = useState(true);
   const [diagnostics, setDiagnostics] = useState<SeriesDiagnostics[]>([]);
@@ -1243,34 +1276,45 @@ export default function TrendPulse() {
     const newVal: BenchmarkValidation[] = [];
     const newRedl: Record<string, { n: number; corr: number | null; mae: number | null }> = {};
 
-    // Google Trends returns hourly data for windows ≤ 7 days, daily for longer.
-    // For sub-daily frequencies over ranges > 7 days we use a sliding 7-day
-    // window with 6-hour overlap (matching the R script strategy).
+    // Google returns hourly (or finer) points only for windows shorter than 7 days AND when the
+    // request carries time-of-day boundaries; otherwise it returns daily points.
+    //   hourly6 : 6-day windows, 6 h overlap -> hourly points (about 144 per window)
+    //   paper24 : 24 h windows, 4 h overlap, 20 h step (the manuscript's design) -> about 8-minute
+    //             points, binned to a 30-minute grid before stitching
     const rangeMs = end.getTime() - start.getTime();
-    const needsWindows =
-      freq !== "daily" && freq !== "weekly" && rangeMs > 7 * 86400000;
-    const WINDOW_MS  = 7 * 86400000;   // 7 days → Google returns hourly
-    const OVERLAP_MS = 6 * 3600000;    // 6 h overlap to smooth seam artefacts
+    const subDaily = freq !== "daily" && freq !== "weekly";
+    const WINDOW_MS  = windowMode === "paper24" ? 24 * 3600000 : 6 * 86400000;
+    const OVERLAP_MS = windowMode === "paper24" ? 4 * 3600000 : 6 * 3600000;
     const STEP_MS    = WINDOW_MS - OVERLAP_MS;
+    const needsWindows = subDaily && rangeMs > WINDOW_MS;
+    const binMin = windowMode === "paper24" ? Math.min(Math.max(freqMinutes(freq), 10), 30) : 0;
 
-    // Pre-compute window list once (same for all keywords)
-    const windows: { s: string; e: string }[] = needsWindows
+    type Win = { s: string; e: string; st?: string; et?: string };
+    const windows: Win[] = needsWindows
       ? (() => {
-          const ws: { s: string; e: string }[] = [];
+          const ws: Win[] = [];
           for (let t = start.getTime(); t < end.getTime(); t += STEP_MS) {
-            ws.push({
-              s: toISODate(new Date(t)),
-              e: toISODate(new Date(Math.min(t + WINDOW_MS, end.getTime()))),
-            });
+            const stT = new Date(t), etT = new Date(Math.min(t + WINDOW_MS - 1000, end.getTime()));
+            ws.push({ s: toISODate(stT), e: toISODate(etT), st: stT.toISOString(), et: etT.toISOString() });
           }
           return ws;
         })()
-      : [{ s: startISO, e: endISO }];
+      : subDaily && rangeMs < 7 * 86400000
+        ? [{ s: startISO, e: endISO, st: start.toISOString(), et: end.toISOString() }]
+        : [{ s: startISO, e: endISO }];
+    setWindowDesc(
+      needsWindows
+        ? (windowMode === "paper24"
+            ? `${windows.length} windows of 24 h, 4 h overlap, 20 h step (about 8-minute source points binned to ${binMin} min)`
+            : `${windows.length} windows of 6 days, 6 h overlap (hourly source points)`)
+        : "single request"
+    );
 
     for (let ki = 0; ki < keywords.length; ki++) {
       const kw = keywords[ki];
       const allRows: TrendRow[] = [];
       const winRows: TrendRow[][] = [];
+      let rawFirst: TrendRow[] = [];
 
       for (let wi = 0; wi < windows.length; wi++) {
         const { s, e } = windows[wi];
@@ -1279,9 +1323,11 @@ export default function TrendPulse() {
             ? `"${kw}" (${ki + 1}/${keywords.length}) — window ${wi + 1}/${windows.length}`
             : `Fetching "${kw}" (${ki + 1}/${keywords.length})…`
         );
-        const raw = await fetchWindow(kw, s, e, geo);
+        const raw = await fetchWindow(kw, s, e, geo, windows[wi].st, windows[wi].et);
         if (raw) {
-          const m = raw.map((r) => ({ ...r, keyword: kw }));
+          let m = raw.map((r) => ({ ...r, keyword: kw })) as TrendRow[];
+          if (!rawFirst.length) rawFirst = m;
+          if (binMin) m = binToGrid(m, binMin);
           allRows.push(...m);
           winRows.push(m);
         }
@@ -1296,9 +1342,10 @@ export default function TrendPulse() {
           base = st.rows;
           newSeams[kw] = st.seams;
         }
+        const rawStep = nativeStepMinutes(rawFirst);
         const out = resampleToFreq(base, freq);
         newData[kw] = out.map((r) => (categories[kw] ? { ...r, category: categories[kw] } : r));
-        newDiag.push(seriesDiagnostics(kw, base, out, freqMinutes(freq)));
+        newDiag.push(seriesDiagnostics(kw, base, out, freqMinutes(freq), windowMode === "paper24" && rawStep ? rawStep : undefined));
         newSparse.push(sparsityStats(kw, base.map((r) => r.hits)));
         realCount++;
 
@@ -1310,12 +1357,14 @@ export default function TrendPulse() {
             const daily = await fetchWindow(kw, startISO, endISO, geo);
             if (daily) {
               newVal.push(validateAgainstDaily(kw, base, daily, newSeams[kw] ?? []));
-              newRes[kw] = { hourly: base, m30: resampleToFreq(base, "30min"), daily };
+              newRes[kw] = windowMode === "paper24"
+                ? { hourly: binToGrid(base, 60), m30: base, daily }
+                : { hourly: base, m30: resampleToFreq(base, "30min"), daily };
             }
           }
           if (winRows[0]) {
             await new Promise((r) => setTimeout(r, 600));
-            const again = await fetchWindow(kw, windows[0].s, windows[0].e, geo);
+            const again = await fetchWindow(kw, windows[0].s, windows[0].e, geo, windows[0].st, windows[0].et);
             if (again) newRedl[kw] = redownloadAgreement(winRows[0], again as TrendRow[]);
           }
         }
@@ -1341,7 +1390,7 @@ export default function TrendPulse() {
     setFetched(true);
     setPage(0);
     setActiveTab("chart");
-  }, [keywords, days, dateMode, startDate, endDate, freq, geo, categories, runValidation]);
+  }, [keywords, days, dateMode, startDate, endDate, freq, geo, categories, runValidation, windowMode]);
 
   /* ── Save / Load / Delete analyses ── */
   const handleSave = useCallback(() => {
@@ -1974,7 +2023,15 @@ export default function TrendPulse() {
           </div>
 
           {/* Fetch button */}
-          <label className="mt-4 flex items-start gap-2 text-[11px] text-[var(--text-muted)] cursor-pointer">
+          <div className="mt-4 flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
+            <span className="uppercase tracking-widest font-semibold">Window design</span>
+            <select value={windowMode} onChange={(e) => setWindowMode(e.target.value as "hourly6" | "paper24")}
+              className="px-3 py-1.5 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-primary)] text-xs">
+              <option value="hourly6">6-day windows, 6 h overlap (hourly source)</option>
+              <option value="paper24">24 h windows, 4 h overlap (manuscript design, about 8-min source; many requests)</option>
+            </select>
+          </div>
+          <label className="mt-3 flex items-start gap-2 text-[11px] text-[var(--text-muted)] cursor-pointer">
             <input type="checkbox" checked={runValidation} onChange={(e) => setRunValidation(e.target.checked)} className="mt-0.5" />
             <span>Validate stitching and compare 30-min, hourly and daily series (2 extra requests per keyword; slower).</span>
           </label>
@@ -2167,7 +2224,7 @@ export default function TrendPulse() {
               </div>
             )}
 
-            <DiagnosticsPanel diag={diagnostics} seams={seamsByKw} validation={validation} redownload={redownload} sparsity={sparsity} />
+            <DiagnosticsPanel diag={diagnostics} seams={seamsByKw} validation={validation} redownload={redownload} sparsity={sparsity} windowDesc={windowDesc} />
 
             {/* Descriptive stats panel */}
             <div className="rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5">

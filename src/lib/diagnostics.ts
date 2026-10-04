@@ -104,10 +104,10 @@ export interface SeriesDiagnostics {
 }
 
 export function seriesDiagnostics(
-  keyword: string, native: RowLike[], output: RowLike[], outputStepMin: number
+  keyword: string, native: RowLike[], output: RowLike[], outputStepMin: number, nativeStepOverride?: number
 ): SeriesDiagnostics {
   const nHits = native.map((r) => r.hits), oHits = output.map((r) => r.hits);
-  const step = nativeStepMinutes(native);
+  const step = nativeStepOverride && Number.isFinite(nativeStepOverride) ? nativeStepOverride : nativeStepMinutes(native);
   const a1n = acf1(nHits), a1o = acf1(oHits);
   return {
     keyword,
