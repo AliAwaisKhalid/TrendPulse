@@ -20,8 +20,35 @@ export const HORMUZ_TABLE2: KeywordEntry[] = [
   { keyword: "Hormuz oil supply", category: "Shipping / Oil Trade" },
 ];
 
+/**
+ * Placebo keywords for the SoH attention index (manuscript Section 4.3.4, Response to Comment 1.13;
+ * see docs/Placebo_Keywords_Selection.docx). Group A: everyday terms with no link to shipping, oil
+ * or the Gulf, which should show no association with herding. Group B: other maritime chokepoints, a
+ * same-domain comparison rather than a pure placebo, because Red Sea or Suez news can co-move with Hormuz news.
+ */
+export const PLACEBO_A: KeywordEntry[] = [
+  { keyword: "weather forecast", category: "Placebo A / Everyday" },
+  { keyword: "football scores", category: "Placebo A / Everyday" },
+  { keyword: "pizza delivery", category: "Placebo A / Everyday" },
+  { keyword: "recipe", category: "Placebo A / Everyday" },
+  { keyword: "tax return", category: "Placebo A / Everyday" },
+  { keyword: "public holidays", category: "Placebo A / Everyday" },
+  { keyword: "train timetable", category: "Placebo A / Everyday" },
+  { keyword: "hotel booking", category: "Placebo A / Everyday" },
+];
+export const PLACEBO_B: KeywordEntry[] = [
+  { keyword: "Panama Canal", category: "Placebo B / Other chokepoint" },
+  { keyword: "Suez Canal", category: "Placebo B / Other chokepoint" },
+  { keyword: "Bab el-Mandeb", category: "Placebo B / Other chokepoint" },
+  { keyword: "Strait of Malacca", category: "Placebo B / Other chokepoint" },
+  { keyword: "Bosphorus", category: "Placebo B / Other chokepoint" },
+];
+export const PLACEBO_ALL: KeywordEntry[] = [...PLACEBO_A, ...PLACEBO_B];
+
 export const KEYWORD_PRESETS: { id: string; label: string; entries: KeywordEntry[] }[] = [
   { id: "hormuz-table2", label: "Strait of Hormuz (Table 2, 11 keywords)", entries: HORMUZ_TABLE2 },
+  { id: "placebo-a", label: "Placebo A: everyday terms (8 keywords)", entries: PLACEBO_A },
+  { id: "placebo-b", label: "Placebo B: other chokepoints (5 keywords)", entries: PLACEBO_B },
 ];
 
 /** Split one CSV/TSV line, honouring double quotes. */

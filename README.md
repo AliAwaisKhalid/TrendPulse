@@ -1,6 +1,6 @@
 # Trend Pulse
 
-Google Trends fetcher for research use, with export to **Excel**, **Stata (.do + CSV)**, **CSV** and **R scripts**, and built-in diagnostics for the resolution and stitching problems described below.
+Google Trends fetcher for research use, with export to **Excel**, **Stata (.dta + .do)**, **CSV** (one column per keyword) and **R scripts**, and built-in diagnostics for the resolution and stitching problems described below.
 
 ## Read this before using the data for inference
 
@@ -35,7 +35,29 @@ The diagnostics table reports, per keyword: native and output step, rows per nat
 
 ## Exports
 
-CSV and Excel (columns include `category`, `interpolated`, `simulated`), an R script (gtrendsR loop with the caveats above), a Stata `.do` + CSV, a Word report, PCA scores, and a **Diagnostics** CSV (also an Excel sheet, plus Seams and Daily benchmark sheets when available).
+CSV (wide, one column per keyword) and long CSV and Excel (columns include `category`, `interpolated`, `simulated`), an R script (gtrendsR loop with the caveats above), a Stata `.dta` + `.do`, a herding-aligned `.dta` + `.csv`, a Word report, PCA scores, and a **Diagnostics** CSV (also an Excel sheet, plus Seams and Daily benchmark sheets when available).
+
+## Placebo keywords (manuscript Section 4.3.4)
+
+Two presets load the placebo keywords for the Strait of Hormuz attention index; the full rationale is in `docs/Placebo_Keywords_Selection.docx` and the list can be downloaded from the app as `placebo_keywords.csv` (also in `public/`).
+
+| Keyword | Group |
+|---|---|
+| weather forecast, football scores, pizza delivery, recipe, tax return, public holidays, train timetable, hotel booking | Placebo A: everyday terms with no link to shipping, oil or the Gulf |
+| Panama Canal, Suez Canal, Bab el-Mandeb, Strait of Malacca, Bosphorus | Placebo B: other maritime chokepoints (a same-domain comparison, not a pure placebo, because Red Sea or Suez news can move with Hormuz news) |
+
+Download the placebo series with the same window design, rescaling and PC1 construction as the Hormuz keywords, and compare their Granger, WQR and QQR results with those of the SoH index.
+
+## Wide CSV and Stata exports
+
+- **CSV** now has one row per UTC time stamp and one column per keyword, named after the keyword (for example `Strait of Hormuz`), plus `gt_sentiment` and `pc1_raw` when the index has been computed and the `interpolated` / `simulated` flags. The previous long layout (`keyword`, `hits`) is still available as **CSV (long)**.
+- **Stata** writes a native `.dta` file (format 114, opens in Stata 10 or later, R `haven` and Python `pandas`) with one variable per keyword (`gt_strait_of_hormuz`, ...; the variable label holds the keyword), `datetime_utc` stored as a Stata `%tc` clock in UTC, and a `.do` file that `tsset`s the data.
+
+## Alignment with the 40-firm shipping herding panel
+
+**Herding-aligned (40 firms)** matches the series to the 1,543 thirty-minute bins of the herding panel (29 Dec 2025 to 26 Mar 2026; bin time stamps in `public/herding_bins_40firms.csv`). Each bin gets the Trends value stamped at the bin's UTC time if one exists, otherwise the latest earlier value within one native step (60 minutes for hourly data); values are never taken from a later time. The export (`.dta` and `.csv`) carries `t_con`, `period_id`, `date_exchange`, `interval_30`, `datetime_utc`, one column per keyword, `gt_sentiment`, `pc1_raw`, `gt_match` (exact / asof / none) and `gt_gap_min`.
+
+The herding bins are defined in exchange-local time (exchange date by 30-minute slot), and each bin carries the UTC time of its first observation. Because the 40 firms trade in different time zones, 168 bins share a UTC time with another bin and the UTC order reverses 311 times in bin order. The app matches each bin at the UTC time stored in the panel and reports these counts on the Exports tab. To cover every bin, fetch 29 Dec 2025 to 26 Mar 2026.
 
 ## Local development and deployment
 

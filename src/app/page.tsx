@@ -28,8 +28,10 @@ import {
 } from "@/lib/diagnostics";
 import ResolutionComparison, { type ResolutionData } from "@/components/ResolutionComparison";
 import {
-  KEYWORD_PRESETS, HORMUZ_TABLE2, entriesToCSV, parseKeywordEntries, type KeywordEntry,
+  KEYWORD_PRESETS, HORMUZ_TABLE2, PLACEBO_ALL, entriesToCSV, parseKeywordEntries, type KeywordEntry,
 } from "@/lib/keywords";
+import { writeDta, sanitizeStataNames, type DtaColumn } from "@/lib/stata";
+import { parseHerdingBins, alignToHerding, HERDING_BINS_URL, type AlignmentSummary } from "@/lib/herding";
 import * as XLSX from "xlsx";
 import {
   Document,
@@ -496,60 +498,39 @@ cat("Done!\\n")
 }
 
 /* ─────────── Stata .do Generator ─────────── */
-function generateStataDoFile(keywords: string[], freq: Frequency): string {
-  const keyword = keywords[0] ?? "keyword";
-  const fname = `${keyword.replace(/\s+/g, "_")}_trends`;
+function generateStataDoFile(keywords: string[], varNames: string[], freq: Frequency, base: string): string {
   const deltaMs = freqMinutes(freq) * 60000;
+  const first = varNames[0] ?? "gt_1";
+  const map = keywords.map((k, i) => `*   ${varNames[i].padEnd(32)} ${k}`).join("\n");
   return `* ══════════════════════════════════════════════════
-* Trend Pulse — Stata Import & Time-Series Setup
-* Keywords: ${keywords.join(", ")} | Freq: ${freq}
-* Note: script uses the first keyword CSV. Run separately for each keyword.
-* CAUTION: Google Trends is ~hourly at best. Sub-hourly grids duplicate or
-* interpolate values, inflating autocorrelation and Granger-test significance.
-* Use the hourly (or coarser) export and the Diagnostics file for validation.
+* Trend Pulse — Stata import (${base}_trends.dta)
+* Frequency: ${freq} | All time stamps in UTC
+* One variable per keyword (variable label = keyword):
+${map}
+* CAUTION: Google Trends is about hourly at best. Sub-hourly grids repeat or
+* interpolate values (interpolated == 1), which inflates autocorrelation.
+* Rows with simulated == 1 are fallback data, not Google Trends output.
 * ══════════════════════════════════════════════════
 
 clear all
 set more off
 
-* ── Import CSV (first keyword) ──
-import delimited "${fname}_${freq}.csv", clear
+use "${base}_trends.dta", clear
+describe
+assert simulated == 0
 
-* ── Create Stata datetime ──
-gen double stata_dt = clock(datetime, "YMDhms#")
-format stata_dt %tcCCYY-NN-DD_HH:MM:SS
+* datetime_utc is a Stata %tc clock (milliseconds since 01jan1960, UTC)
+format datetime_utc %tcCCYY-NN-DD_HH:MM
+gen int  s_year  = year(dofc(datetime_utc))
+gen byte s_month = month(dofc(datetime_utc))
+gen byte s_hour  = hh(datetime_utc)
+gen byte s_dow   = dow(dofc(datetime_utc))
 
-* ── Time components ──
-gen int s_year = year(dofC(stata_dt))
-gen byte s_month = month(dofC(stata_dt))
-gen byte s_day = day(dofC(stata_dt))
-gen byte s_hour = hh(stata_dt)
-gen byte s_minute = mm(stata_dt)
-gen byte s_dow = dow(dofC(stata_dt))
+tsset datetime_utc, delta(${deltaMs})
+summarize gt_*
 
-gen double clock_time = (s_hour * 3600 + s_minute * 60) * 1000
-format clock_time %tcHH:MM
-
-gen byte is_weekend = (s_dow == 0 | s_dow == 6)
-label define wknd 0 "Weekday" 1 "Weekend"
-label values is_weekend wknd
-
-tsset stata_dt, delta(${deltaMs})
-
-gen double ma6  = (L3.hits + L2.hits + L1.hits + hits + F1.hits + F2.hits) / 6
-gen double ma12 = (L6.hits + L5.hits + L4.hits + L3.hits + L2.hits + L1.hits ///
-                 + hits + F1.hits + F2.hits + F3.hits + F4.hits + F5.hits) / 12
-label var ma6  "6-period MA"
-label var ma12 "12-period MA"
-
-tsline hits, title("${keyword} — Google Trends") ///
-  ytitle("Interest (0-100)") xtitle("") lcolor(emerald) lwidth(thin)
-
-twoway (tsline hits, lcolor(gs12) lwidth(vthin)) ///
-       (tsline ma6, lcolor(emerald) lwidth(medthick)) ///
-       (tsline ma12, lcolor(orange) lwidth(medthick)), ///
-  title("${keyword} — with Moving Averages") ///
-  legend(order(1 "Raw" 2 "MA-6" 3 "MA-12"))
+tsline ${first}, title("\`: variable label ${first}' (Google Trends)") ///
+  ytitle("Interest (0-100)") xtitle("UTC") lwidth(thin)
 `;
 }
 
@@ -1262,6 +1243,8 @@ export default function TrendPulse() {
   const [loading, setLoading] = useState(false);
   const [fetched, setFetched] = useState(false);
   const [dataSource, setDataSource] = useState<"real" | "simulated" | "mixed" | null>(null);
+  const [herdingSummary, setHerdingSummary] = useState<AlignmentSummary | null>(null);
+  const [herdingError, setHerdingError] = useState<string | null>(null);
   const [fetchProgress, setFetchProgress] = useState<string>("");
   const [windowMode, setWindowMode] = useState<"hourly6" | "paper24">("hourly6");
   const [stitchMode, setStitchMode] = useState<"chain" | "anchor">("chain");
@@ -1695,12 +1678,52 @@ export default function TrendPulse() {
   };
 
   /* ── Exports ── */
+  /** Wide layout: one row per UTC time stamp, one column per keyword. */
+  const wideRows = () => {
+    const kws = Object.keys(dataByKeyword);
+    const byTime = new Map<string, { datetime: string; date: string; time: string; vals: Record<string, number>; interp: boolean; sim: boolean }>();
+    for (const kw of kws) for (const r of dataByKeyword[kw]) {
+      let e = byTime.get(r.datetime);
+      if (!e) { e = { datetime: r.datetime, date: r.date, time: r.time, vals: {}, interp: false, sim: false }; byTime.set(r.datetime, e); }
+      e.vals[kw] = r.hits;
+      e.interp = e.interp || !!r.interpolated;
+      e.sim = e.sim || !!r.simulated;
+    }
+    return { kws, rows: [...byTime.values()].sort((a, b) => (a.datetime < b.datetime ? -1 : a.datetime > b.datetime ? 1 : 0)) };
+  };
+
+  const sentimentMap = () => {
+    if (!gtSentiment) return null;
+    const m = new Map<string, { s: number; p: number }>();
+    gtSentiment.chartRows.forEach((row, i) => m.set(row.datetime, { s: row.sentiment, p: gtSentiment.pc1Raw[i] }));
+    return m;
+  };
+
+  const csvCell = (v: unknown) => {
+    if (v === null || v === undefined) return "";
+    const t = String(v);
+    return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+
   const exportCSV = () => {
+    const { kws, rows } = wideRows();
+    if (!rows.length) return;
+    const sent = sentimentMap();
+    const header = ["datetime_utc", "date_utc", "time_utc", ...kws, ...(sent ? ["gt_sentiment", "pc1_raw"] : []), "interpolated", "simulated"];
+    const body = rows.map((r) => [
+      r.datetime, r.date, r.time, ...kws.map((k) => r.vals[k] ?? ""),
+      ...(sent ? [sent.get(r.datetime)?.s.toFixed(2) ?? "", sent.get(r.datetime)?.p.toFixed(4) ?? ""] : []),
+      r.interp ? 1 : 0, r.sim ? 1 : 0,
+    ].map(csvCell).join(","));
+    saveAs(new Blob([header.map(csvCell).join(",") + "\n" + body.join("\n")], { type: "text/csv;charset=utf-8" }), `${fileBase(keywords)}_trends.csv`);
+  };
+
+  const exportLongCSV = () => {
     const header = "keyword,datetime,date,time,year,month,day,hour,minute,dow,dow_name,quarter,weekend,hits,category,interpolated,simulated\n";
     const rows = flatData.map((r) =>
-      `${r.keyword},${r.datetime},${r.date},${r.time},${r.year},${r.month},${r.day},${r.hour},${r.minute},${r.dow},${r.dowName},${r.quarter},${r.weekend ? 1 : 0},${r.hits},"${r.category ?? ""}",${r.interpolated ? 1 : 0},${r.simulated ? 1 : 0}`
+      `${csvCell(r.keyword)},${r.datetime},${r.date},${r.time},${r.year},${r.month},${r.day},${r.hour},${r.minute},${r.dow},${r.dowName},${r.quarter},${r.weekend ? 1 : 0},${r.hits},${csvCell(r.category ?? "")},${r.interpolated ? 1 : 0},${r.simulated ? 1 : 0}`
     ).join("\n");
-    saveAs(new Blob([header + rows], { type: "text/csv;charset=utf-8" }), `${fileBase(keywords)}_trends.csv`);
+    saveAs(new Blob([header + rows], { type: "text/csv;charset=utf-8" }), `${fileBase(keywords)}_trends_long.csv`);
   };
 
   const exportGTSentimentCSV = () => {
@@ -1813,9 +1836,76 @@ export default function TrendPulse() {
   };
 
   const exportStata = () => {
-    exportCSV();
-    const doFile = generateStataDoFile(keywords, freq);
-    saveAs(new Blob([doFile], { type: "text/plain;charset=utf-8" }), `${fileBase(keywords)}_trends.do`);
+    const { kws, rows } = wideRows();
+    if (!rows.length) return;
+    const names = sanitizeStataNames(kws, "gt_");
+    const sent = sentimentMap();
+    const cols: DtaColumn[] = [
+      { name: "datetime_utc", kind: "datetime", label: "Google Trends time stamp (UTC)", values: rows.map((r) => r.datetime) },
+      { name: "date_utc", kind: "string", label: "Date (UTC)", values: rows.map((r) => r.date) },
+      { name: "time_utc", kind: "string", label: "Time (UTC)", values: rows.map((r) => r.time) },
+      ...kws.map((kw, j): DtaColumn => ({ name: names[j], kind: "double", label: kw.slice(0, 80), values: rows.map((r) => r.vals[kw] ?? null) })),
+    ];
+    if (sent) cols.push(
+      { name: "gt_sentiment", kind: "double", label: "Attention index: PC1 rescaled to 0-100", values: rows.map((r) => sent.get(r.datetime)?.s ?? null) },
+      { name: "pc1_raw", kind: "double", label: "First principal component (raw)", values: rows.map((r) => sent.get(r.datetime)?.p ?? null) },
+    );
+    cols.push(
+      { name: "interpolated", kind: "double", label: "1 = value interpolated onto a finer grid", values: rows.map((r) => (r.interp ? 1 : 0)) },
+      { name: "simulated", kind: "double", label: "1 = simulated fallback, not Google Trends data", values: rows.map((r) => (r.sim ? 1 : 0)) },
+    );
+    const base = fileBase(keywords);
+    const dta = writeDta(cols, `Trend Pulse ${freq}, UTC`);
+    saveAs(new Blob([dta.buffer as ArrayBuffer], { type: "application/x-stata-dta" }), `${base}_trends.dta`);
+    saveAs(new Blob([generateStataDoFile(kws, names, freq, base)], { type: "text/plain;charset=utf-8" }), `${base}_trends.do`);
+  };
+
+  /** Align the series to the 1,543 bins of the 40-firm herding panel and export .dta + .csv. */
+  const exportHerdingAligned = async () => {
+    setHerdingError(null);
+    const { kws, rows } = wideRows();
+    if (!rows.length) return;
+    try {
+      const res = await fetch(HERDING_BINS_URL);
+      if (!res.ok) throw new Error(`Could not load ${HERDING_BINS_URL} (${res.status})`);
+      const bins = parseHerdingBins(await res.text());
+      const sent = sentimentMap();
+      const series: Record<string, { datetime: string; value: number | null }[]> = {};
+      for (const kw of kws) series[kw] = rows.map((r) => ({ datetime: r.datetime, value: r.vals[kw] ?? null }));
+      if (sent) {
+        series["__gt_sentiment"] = rows.map((r) => ({ datetime: r.datetime, value: sent.get(r.datetime)?.s ?? null }));
+        series["__pc1_raw"] = rows.map((r) => ({ datetime: r.datetime, value: sent.get(r.datetime)?.p ?? null }));
+      }
+      const maxGap = Math.max(60, freqMinutes(freq));
+      const { rows: al, summary } = alignToHerding(bins, series, maxGap);
+      setHerdingSummary(summary);
+      const names = sanitizeStataNames(kws, "gt_");
+      const cols: DtaColumn[] = [
+        { name: "t_con", kind: "double", label: "Bin counter in the herding panel", values: al.map((a) => a.bin.t_con) },
+        { name: "period_id", kind: "double", label: "period_id in the herding panel", values: al.map((a) => a.bin.period_id) },
+        { name: "date_exchange", kind: "string", label: "Exchange date of the bin", values: al.map((a) => a.bin.date_exchange) },
+        { name: "interval_30", kind: "double", label: "30-minute bin in exchange time", values: al.map((a) => a.bin.interval_30) },
+        { name: "datetime_utc", kind: "datetime", label: "UTC time of the bin (herding panel)", values: al.map((a) => a.bin.datetime_utc) },
+        ...kws.map((kw, j): DtaColumn => ({ name: names[j], kind: "double", label: kw.slice(0, 80), values: al.map((a) => a.values[kw]) })),
+      ];
+      if (sent) cols.push(
+        { name: "gt_sentiment", kind: "double", label: "Attention index: PC1 rescaled to 0-100", values: al.map((a) => a.values["__gt_sentiment"]) },
+        { name: "pc1_raw", kind: "double", label: "First principal component (raw)", values: al.map((a) => a.values["__pc1_raw"]) },
+      );
+      cols.push(
+        { name: "gt_match", kind: "string", label: "exact / asof (latest earlier value) / none", values: al.map((a) => a.match) },
+        { name: "gt_gap_min", kind: "double", label: "Minutes between bin and Trends value used", values: al.map((a) => a.gapMin) },
+      );
+      const base = `${fileBase(keywords)}_herding40_aligned`;
+      const dta = writeDta(cols, "Trend Pulse aligned to 40-firm herding bins");
+      saveAs(new Blob([dta.buffer as ArrayBuffer], { type: "application/x-stata-dta" }), `${base}.dta`);
+      const header = ["t_con", "period_id", "date_exchange", "interval_30", "datetime_utc", ...kws, ...(sent ? ["gt_sentiment", "pc1_raw"] : []), "gt_match", "gt_gap_min"];
+      const body = al.map((a) => [a.bin.t_con, a.bin.period_id, a.bin.date_exchange, a.bin.interval_30, a.bin.datetime_utc,
+        ...kws.map((k) => a.values[k]), ...(sent ? [a.values["__gt_sentiment"], a.values["__pc1_raw"]] : []), a.match, a.gapMin].map(csvCell).join(","));
+      saveAs(new Blob([header.map(csvCell).join(",") + "\n" + body.join("\n")], { type: "text/csv;charset=utf-8" }), `${base}.csv`);
+    } catch (err) {
+      setHerdingError(String(err));
+    }
   };
 
   const exportDocx = async () => {
@@ -2009,6 +2099,13 @@ export default function TrendPulse() {
                   className="px-3 py-1.5 rounded-lg text-[11px] font-medium border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
                 >
                   ⬇ Table 2 keyword file
+                </button>
+                <button
+                  type="button"
+                  onClick={() => saveAs(new Blob([entriesToCSV(PLACEBO_ALL)], { type: "text/csv;charset=utf-8" }), "placebo_keywords.csv")}
+                  className="px-3 py-1.5 rounded-lg text-[11px] font-medium border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--accent)] hover:border-[var(--accent)]/40 transition-colors"
+                >
+                  ⬇ Placebo keyword file
                 </button>
               </div>
 
@@ -2914,10 +3011,12 @@ export default function TrendPulse() {
             {activeTab === "exports" && (
               <div className="animate-fade-in-up grid grid-cols-1 md:grid-cols-2 gap-4" style={{ animationDelay: "80ms" }}>
                 {[
-                  { title: "CSV", desc: `All keywords in one file with keyword column. ${flatData.length.toLocaleString()} rows.`, icon: "📄", ext: ".csv", handler: exportCSV, color: "var(--accent)" },
+                  { title: "CSV", desc: `One row per UTC time stamp, one column per keyword (column named after the keyword). ${keywords.length} keyword column${keywords.length > 1 ? "s" : ""}.`, icon: "📄", ext: ".csv", handler: exportCSV, color: "var(--accent)" },
+                  { title: "CSV (long)", desc: `Long layout with keyword and hits columns. ${flatData.length.toLocaleString()} rows.`, icon: "🧾", ext: ".csv", handler: exportLongCSV, color: "var(--text-muted)" },
                   { title: "Excel", desc: `Combined sheet + one sheet per keyword. ${keywords.length} keyword sheet${keywords.length > 1 ? "s" : ""}.`, icon: "📊", ext: ".xlsx", handler: exportExcel, color: "#4CAF50" },
                   { title: "R Script", desc: `gtrendsR loop for all ${keywords.length} keyword${keywords.length > 1 ? "s" : ""} — writes intraday (${freq}) + daily CSVs per keyword plus combined daily.`, icon: "📐", ext: ".R", handler: exportRScript, color: "#2196F3" },
-                  { title: "Stata", desc: "CSV + .do file with tsset, moving averages, and plots (first keyword).", icon: "📈", ext: ".do + .csv", handler: exportStata, color: "#FF9800" },
+                  { title: "Stata", desc: "Stata .dta (one variable per keyword, labelled with the keyword; datetime_utc as %tc) plus a .do file with tsset and a plot.", icon: "📈", ext: ".dta + .do", handler: exportStata, color: "#FF9800" },
+                  { title: "Herding-aligned (40 firms)", desc: "Matches the series to the 1,543 30-minute bins of the 40-firm shipping herding panel (29 Dec 2025 to 26 Mar 2026) by each bin's UTC time: exact time stamp, else the latest earlier value within one native step. Exports .dta and .csv with t_con, period_id and match flags.", icon: "🚢", ext: ".dta + .csv", handler: exportHerdingAligned, color: "#14B8A6" },
                   { title: "Word Report", desc: `Full .docx report: ${keywords.length} keyword${keywords.length > 1 ? "s" : ""}, collection process, timeline, per-keyword stats (mean, median, variance, skewness, kurtosis), and cutoff comparison if set.`, icon: "📝", ext: ".docx", handler: exportDocx, color: "#2B579A" },
                   ...(diagnostics.length ? [{ title: "Diagnostics", desc: "Native vs output resolution, duplicated-value share, lag-1 autocorrelation, effective N, window seams and daily-benchmark checks, per keyword.", icon: "🧪", ext: ".csv", handler: exportDiagnosticsCSV, color: "#FBBF24" }] : []),
                   ...(pcaResult ? [{ title: "PCA Scores", desc: `PC scores time series — ${pcaResult.nVars} components × ${pcaResult.nObs.toLocaleString()} observations. PC1 explains ${(pcaResult.explainedVar[0] * 100).toFixed(1)}% of variance.`, icon: "🔬", ext: ".csv", handler: exportPCAcsv, color: "var(--accent-secondary)" }] : []),
@@ -2938,6 +3037,20 @@ export default function TrendPulse() {
                     </div>
                   </button>
                 ))}
+                {(herdingSummary || herdingError) && (
+                  <div className="md:col-span-2 rounded-xl border border-[var(--border)] bg-[var(--bg-secondary)] p-4 text-xs text-[var(--text-secondary)] space-y-1">
+                    <div className="font-semibold text-[var(--text-primary)]">Alignment with the 40-firm herding bins</div>
+                    {herdingError && <div className="text-red-400">{herdingError}</div>}
+                    {herdingSummary && (
+                      <>
+                        <div>Bins: {herdingSummary.nBins.toLocaleString()} · exact time match: {herdingSummary.exact.toLocaleString()} · earlier value (as-of): {herdingSummary.asof.toLocaleString()} · no Trends value: {herdingSummary.none.toLocaleString()}</div>
+                        <div>Bins span {herdingSummary.firstBin} to {herdingSummary.lastBin} UTC; the Trends series spans {herdingSummary.seriesStart} to {herdingSummary.seriesEnd} UTC.</div>
+                        <div>The herding bins are defined in exchange-local time: {herdingSummary.nBins - herdingSummary.uniqueUtcTimes} bins share a UTC time with another bin and the UTC order reverses {herdingSummary.nonMonotonic} times. Each bin is matched at the UTC time stored in the panel.</div>
+                        {herdingSummary.none > 0 && <div className="text-amber-400">Some bins have no Trends value: widen the date range to cover 29 Dec 2025 to 26 Mar 2026.</div>}
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </>
