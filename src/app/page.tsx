@@ -27,6 +27,7 @@ import {
   type SeriesDiagnostics, type SeamInfo, type AnchorInfo, type BenchmarkValidation, type SparsityStats,
 } from "@/lib/diagnostics";
 import ResolutionComparison, { type ResolutionData } from "@/components/ResolutionComparison";
+import HeroTrace from "@/components/HeroTrace";
 import {
   KEYWORD_PRESETS, HORMUZ_TABLE2, PLACEBO_ALL, entriesToCSV, parseKeywordEntries, type KeywordEntry,
 } from "@/lib/keywords";
@@ -86,12 +87,12 @@ type DateMode = "relative" | "range";
 
 /* 30-color palette — one colour per keyword */
 const KW_COLORS = [
-  "#00e5a0", "#7c5cff", "#ffb347", "#ff5c5c", "#2196F3",
-  "#E91E63", "#00BCD4", "#8BC34A", "#FF9800", "#9C27B0",
-  "#3F51B5", "#009688", "#F44336", "#FF5722", "#ff7043",
-  "#607D8B", "#c6d600", "#FFC107", "#00E5FF", "#76FF03",
-  "#FF4081", "#40C4FF", "#69F0AE", "#FFD740", "#FF6D00",
-  "#651FFF", "#00B0FF", "#1DE9B6", "#F50057", "#EEFF41",
+  "#1F4E79", "#C8102E", "#2E6F5E", "#A0700B", "#6B4E9B",
+  "#13808A", "#B5532A", "#4B5D6B", "#8A2D5C", "#3C7A2E",
+  "#2B6CB0", "#9C4221", "#5B6B1F", "#7A3E9D", "#0F5E6E",
+  "#8C5A2B", "#365F91", "#A33C3C", "#4F7942", "#5D4B8A",
+  "#1B6F8F", "#B07A1F", "#6E3B3B", "#2F6B5A", "#7F4F24",
+  "#3A4F7A", "#8E2F4F", "#4E6E58", "#6B5B2E", "#2C3E50",
 ];
 
 const MAX_KEYWORDS = 30;
@@ -1019,7 +1020,7 @@ function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windo
         Data-source diagnostics: resolution and window stitching
       </div>
       {over.length > 0 ? (
-        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-300 leading-relaxed">
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 leading-relaxed">
           The selected grid is finer than the source data. Google Trends supplies about one observation per
           {" "}{Math.round(over[0].nativeStepMin)} minutes here, so the {Math.round(over[0].outputStepMin)}-minute series repeats or
           interpolates values and adds no information. This inflates short-lag autocorrelation and the apparent
@@ -1027,7 +1028,7 @@ function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windo
           (see N<sub>eff</sub> below). Use the native-resolution series for inference.
         </div>
       ) : (
-        <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 p-3 text-xs text-emerald-400">
+        <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 p-3 text-xs text-emerald-700">
           The output grid is not finer than the native resolution of the source data.
         </div>
       )}
@@ -1073,7 +1074,7 @@ function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windo
                     <td className={td}>{q.n.toLocaleString()}</td><td className={td}>{f2(q.mean)}</td><td className={td}>{f2(q.cv)}</td>
                     <td className={td}>{pct(q.zeroShare)}</td><td className={td}>{pct(q.lowShare)}</td>
                     <td className={td}>{q.maxZeroRun}</td><td className={td}>{f2(q.acf1)}</td>
-                    <td className={td} style={{ color: q.flag ? "#fbbf24" : undefined }}>{q.flag ?? "ok"}</td>
+                    <td className={td} style={{ color: q.flag ? "#9A5B00" : undefined }}>{q.flag ?? "ok"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1101,11 +1102,11 @@ function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windo
                     <tr key={kw} className="border-b border-[var(--border)]/50">
                       <td className="px-3 py-2 text-[var(--text-primary)]">{kw}</td>
                       <td className={td}>{ss.length}</td>
-                      <td className={td} style={{ color: ss.some((x) => x.flag) ? "#fbbf24" : undefined }}>{ss.filter((x) => x.flag).length}</td>
+                      <td className={td} style={{ color: ss.some((x) => x.flag) ? "#9A5B00" : undefined }}>{ss.filter((x) => x.flag).length}</td>
                       <td className={td}>{ss.length ? ss[ss.length - 1].cumulativeScale.toFixed(2) : "n/a"}</td>
                       <td className={td}>{corrs.length ? f2(Math.min(...corrs)) : "n/a"}</td>
                       <td className={td}>{ss.filter((x) => x.relErr !== null && x.relErr >= 0.25).length}</td>
-                      <td className={td} style={{ color: (empties[kw]?.empty ?? 0) > 0 ? "#fbbf24" : undefined }}>{empties[kw] ? `${empties[kw].empty} of ${empties[kw].total}` : "n/a"}</td>
+                      <td className={td} style={{ color: (empties[kw]?.empty ?? 0) > 0 ? "#9A5B00" : undefined }}>{empties[kw] ? `${empties[kw].empty} of ${empties[kw].total}` : "n/a"}</td>
                     </tr>
                   );
                 })}
@@ -1132,7 +1133,7 @@ function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windo
                     <td className={td}>{a.requested ? a.usedWindows : "not requested"}</td>
                     <td className={td}>{a.requested ? a.fallbackWindows : "n/a"}</td>
                     <td className={td}>{f2(a.corrWithChain)}</td>
-                    <td className={td} style={{ color: a.maxRatio !== null && a.maxRatio > 1.5 ? "#fbbf24" : undefined }}>{a.maxRatio !== null ? a.maxRatio.toFixed(2) : "n/a"}</td>
+                    <td className={td} style={{ color: a.maxRatio !== null && a.maxRatio > 1.5 ? "#9A5B00" : undefined }}>{a.maxRatio !== null ? a.maxRatio.toFixed(2) : "n/a"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1165,7 +1166,7 @@ function DiagnosticsPanel({ diag, seams, validation, redownload, sparsity, windo
                     <td className={td}>{v.nDays}</td><td className={td}>{f2(v.corrLevels)}</td>
                     <td className={td}>{f2(v.spearmanLevels)}</td><td className={td}>{f2(v.corrDiffs)}</td>
                     <td className={td}>{f2(v.maeScaled)}</td><td className={td}>{f2(redownload[v.keyword]?.corr)}</td>
-                    <td className={td} style={{ color: v.verdict === "consistent" ? "#34d399" : v.verdict === "weak" ? "#fbbf24" : undefined }}>{v.verdict}</td>
+                    <td className={td} style={{ color: v.verdict === "consistent" ? "#2E6F5E" : v.verdict === "weak" ? "#9A5B00" : undefined }}>{v.verdict}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1947,46 +1948,48 @@ export default function TrendPulse() {
     <div className="relative z-10 min-h-screen">
 
       {/* Header */}
-      <header className="border-b border-[var(--border)] bg-[var(--bg-secondary)]/60 backdrop-blur-md sticky top-0 z-50">
+      <header className="border-b border-[var(--border)] bg-[var(--bg-secondary)]/95 backdrop-blur-md sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-[var(--accent)] flex items-center justify-center pulse-glow">
-              <svg viewBox="0 0 24 24" fill="none" className="w-5 h-5" stroke="var(--bg-primary)" strokeWidth={2.5}>
-                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+            <div className="w-9 h-9 rounded-full border-2 border-[var(--accent)] flex items-center justify-center" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" className="w-5 h-5">
+                <polyline points="2 17 7 17 10 15 13 16 15 6 17 13 22 13" stroke="var(--accent)" strokeWidth={2} strokeLinejoin="round" />
+                <circle cx="15" cy="6" r="2.2" fill="var(--accent-secondary)" />
               </svg>
             </div>
             <div>
-              <h1 className="text-lg font-bold tracking-tight">Trend Pulse</h1>
-              <p className="text-[11px] text-[var(--text-muted)] tracking-wide uppercase">Google Trends · native hourly + diagnostics</p>
+              <h1 className="font-display text-2xl font-extrabold uppercase leading-none tracking-[0.04em]">Trend Pulse</h1>
+              <p className="hidden sm:block font-mono text-[10px] text-[var(--text-muted)] tracking-[0.14em] uppercase mt-1">Google Trends · native hourly · diagnostics</p>
             </div>
           </div>
           <div className="flex items-center gap-3">
             <Badge variant="muted">UTC</Badge>
             {dataSource === "real" && (
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide uppercase rounded-full border bg-emerald-500/15 text-emerald-400 border-emerald-500/30">
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide uppercase rounded-full border bg-emerald-500/15 text-emerald-700 border-emerald-500/30">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                 Live Data
               </span>
             )}
             {dataSource === "simulated" && (
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide uppercase rounded-full border bg-amber-500/15 text-amber-400 border-amber-500/30">
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide uppercase rounded-full border bg-amber-500/15 text-amber-700 border-amber-500/30">
                 <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
                 Simulated
               </span>
             )}
             {dataSource === "mixed" && (
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide uppercase rounded-full border bg-blue-500/15 text-blue-400 border-blue-500/30">
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide uppercase rounded-full border bg-blue-500/15 text-blue-700 border-blue-500/30">
                 <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
                 Mixed
               </span>
             )}
-            <Badge variant="accent">v3.1</Badge>
-            <Badge variant="muted">Google Trends</Badge>
+            <span className="hidden sm:inline-flex gap-3"><Badge variant="accent">v3.1</Badge>
+            <Badge variant="muted">Google Trends</Badge></span>
           </div>
         </div>
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-8 space-y-8">
+        <HeroTrace />
 
         {/* Controls */}
         <section className="animate-fade-in-up rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-6" style={{ animationDelay: "100ms" }}>
@@ -2202,7 +2205,7 @@ export default function TrendPulse() {
                 {FREQ_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}{o.value === "1hour" ? " (native)" : ""}</option>)}
               </select>
               {freqMinutes(freq) < 60 && (
-                <p className="mt-2 text-[10px] leading-relaxed text-amber-400">
+                <p className="mt-2 text-[10px] leading-relaxed text-amber-700">
                   ⚠ Google Trends is about hourly at best. A {freq} grid repeats or interpolates hourly values, adds no
                   information and inflates autocorrelation and Granger-test significance. Use 1 hour for inference.
                 </p>
@@ -2313,7 +2316,7 @@ export default function TrendPulse() {
                 value={cutoffDate}
                 onChange={(e) => setCutoffDate(e.target.value)}
                 className="px-3 py-2 rounded-lg bg-[var(--bg-secondary)] border text-[var(--text-primary)] focus:outline-none transition-colors font-mono text-sm"
-                style={{ borderColor: cutoffDate ? "#ffb347" : "var(--border)" }}
+                style={{ borderColor: cutoffDate ? "#A0700B" : "var(--border)" }}
               />
               {cutoffDate && (
                 <button onClick={() => setCutoffDate("")}
@@ -2322,7 +2325,7 @@ export default function TrendPulse() {
                 </button>
               )}
             </div>
-            {cutoffDate && <span className="text-xs font-mono" style={{ color: "#ffb347" }}>◀ Before {cutoffDate} | After ▶</span>}
+            {cutoffDate && <span className="text-xs font-mono" style={{ color: "#A0700B" }}>◀ Before {cutoffDate} | After ▶</span>}
           </div>
 
           {/* Info bar */}
@@ -2413,10 +2416,10 @@ export default function TrendPulse() {
             {dataSource && (
               <div className={`flex items-center gap-3 px-4 py-2.5 rounded-xl border text-xs font-medium ${
                 dataSource === "real"
-                  ? "bg-emerald-500/10 border-emerald-500/25 text-emerald-400"
+                  ? "bg-emerald-500/10 border-emerald-500/25 text-emerald-700"
                   : dataSource === "simulated"
-                  ? "bg-amber-500/10 border-amber-500/25 text-amber-400"
-                  : "bg-blue-500/10 border-blue-500/25 text-blue-400"
+                  ? "bg-amber-500/10 border-amber-500/25 text-amber-700"
+                  : "bg-blue-500/10 border-blue-500/25 text-blue-700"
               }`}>
                 <span className={`w-2 h-2 rounded-full flex-shrink-0 ${
                   dataSource === "real" ? "bg-emerald-400 animate-pulse" :
@@ -2537,7 +2540,7 @@ export default function TrendPulse() {
                       Interest Over Time — {keywords.join(", ")}
                     </h3>
                     {cutoffXValue && (
-                      <span className="text-xs font-mono px-2 py-1 rounded-full border" style={{ color: "#ffb347", borderColor: "#ffb347", background: "#ffb34711" }}>
+                      <span className="text-xs font-mono px-2 py-1 rounded-full border" style={{ color: "#A0700B", borderColor: "#A0700B", background: "#A0700B11" }}>
                         Cutoff: {cutoffDate}
                       </span>
                     )}
@@ -2558,9 +2561,9 @@ export default function TrendPulse() {
                           <XAxis dataKey="datetime" tickFormatter={formatAxisDate} tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} minTickGap={60} />
                           <YAxis domain={[0, 100]} tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={false} tickLine={false} width={35} />
                           <Tooltip content={<CustomTooltip />} />
-                          {cutoffXValue && <ReferenceArea x1={cutoffXValue} fill="#7c5cff" fillOpacity={0.07} />}
+                          {cutoffXValue && <ReferenceArea x1={cutoffXValue} fill="#6B4E9B" fillOpacity={0.07} />}
                           <Area type="monotone" dataKey={keywords[0]} stroke={KW_COLORS[0]} strokeWidth={1.5} fill="url(#areaGrad)" dot={false} activeDot={{ r: 4, fill: KW_COLORS[0], stroke: "var(--bg-primary)", strokeWidth: 2 }} />
-                          {cutoffXValue && <ReferenceLine x={cutoffXValue} stroke="#ffb347" strokeWidth={2} strokeDasharray="6 3" label={{ value: cutoffDate, position: "insideTopRight", fill: "#ffb347", fontSize: 10, fontFamily: "monospace" }} />}
+                          {cutoffXValue && <ReferenceLine x={cutoffXValue} stroke="#A0700B" strokeWidth={2} strokeDasharray="6 3" label={{ value: cutoffDate, position: "insideTopRight", fill: "#A0700B", fontSize: 10, fontFamily: "monospace" }} />}
                           <Brush dataKey="datetime" height={28} stroke="var(--border-accent)" fill="var(--bg-secondary)" tickFormatter={formatAxisDate} />
                         </AreaChart>
                       ) : (
@@ -2570,11 +2573,11 @@ export default function TrendPulse() {
                           <XAxis dataKey="datetime" tickFormatter={formatAxisDate} tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} minTickGap={60} />
                           <YAxis domain={[0, 100]} tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={false} tickLine={false} width={35} />
                           <Tooltip content={<CustomTooltip />} />
-                          {cutoffXValue && <ReferenceArea x1={cutoffXValue} fill="#7c5cff" fillOpacity={0.07} />}
+                          {cutoffXValue && <ReferenceArea x1={cutoffXValue} fill="#6B4E9B" fillOpacity={0.07} />}
                           {keywords.map((kw, i) => (
                             <Line key={kw} type="monotone" dataKey={kw} stroke={KW_COLORS[i]} strokeWidth={1.5} dot={false} activeDot={{ r: 3, fill: KW_COLORS[i], strokeWidth: 0 }} />
                           ))}
-                          {cutoffXValue && <ReferenceLine x={cutoffXValue} stroke="#ffb347" strokeWidth={2} strokeDasharray="6 3" label={{ value: cutoffDate, position: "insideTopRight", fill: "#ffb347", fontSize: 10, fontFamily: "monospace" }} />}
+                          {cutoffXValue && <ReferenceLine x={cutoffXValue} stroke="#A0700B" strokeWidth={2} strokeDasharray="6 3" label={{ value: cutoffDate, position: "insideTopRight", fill: "#A0700B", fontSize: 10, fontFamily: "monospace" }} />}
                           {keywords.length <= 15 && <Legend wrapperStyle={{ fontSize: 11, paddingTop: 8 }} />}
                           <Brush dataKey="datetime" height={28} stroke="var(--border-accent)" fill="var(--bg-secondary)" tickFormatter={formatAxisDate} />
                         </LineChart>
@@ -2588,7 +2591,7 @@ export default function TrendPulse() {
                   <div className="animate-fade-in-up grid grid-cols-1 md:grid-cols-2 gap-4" style={{ animationDelay: "120ms" }}>
                     {[
                       { label: "Before Cutoff", s: cutoffStats.before, color: "var(--accent)", prefix: `< ${cutoffDate}` },
-                      { label: "After Cutoff", s: cutoffStats.after, color: "#7c5cff", prefix: `≥ ${cutoffDate}` },
+                      { label: "After Cutoff", s: cutoffStats.after, color: "#6B4E9B", prefix: `≥ ${cutoffDate}` },
                     ].map(({ label, s, color, prefix }) => (
                       <div key={label} className="rounded-2xl border bg-[var(--bg-card)] p-5" style={{ borderColor: color + "55" }}>
                         <div className="flex items-center gap-2 mb-4">
@@ -2728,17 +2731,17 @@ export default function TrendPulse() {
                         <AreaChart data={gtSentiment.chartRows} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
                           <defs>
                             <linearGradient id="sentimentGrad" x1="0" y1="0" x2="0" y2="1">
-                              <stop offset="0%" stopColor="#00e5a0" stopOpacity={0.55} />
-                              <stop offset="50%" stopColor="#ffb347" stopOpacity={0.12} />
-                              <stop offset="100%" stopColor="#ff5c5c" stopOpacity={0.55} />
+                              <stop offset="0%" stopColor="#2E6F5E" stopOpacity={0.55} />
+                              <stop offset="50%" stopColor="#A0700B" stopOpacity={0.12} />
+                              <stop offset="100%" stopColor="#C8102E" stopOpacity={0.55} />
                             </linearGradient>
                           </defs>
                           <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
                           <XAxis dataKey="datetime" tickFormatter={formatAxisDate} tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} minTickGap={60} />
                           <YAxis domain={[0, 100]} tick={{ fill: "var(--text-muted)", fontSize: 11 }} axisLine={false} tickLine={false} width={35} />
                           <Tooltip content={<CustomTooltip />} />
-                          <ReferenceLine y={50} stroke="#ffb347" strokeDasharray="6 3" strokeWidth={1.5}
-                            label={{ value: "Neutral  50", position: "insideTopRight", fill: "#ffb347", fontSize: 10, fontFamily: "monospace" }} />
+                          <ReferenceLine y={50} stroke="#A0700B" strokeDasharray="6 3" strokeWidth={1.5}
+                            label={{ value: "Neutral  50", position: "insideTopRight", fill: "#A0700B", fontSize: 10, fontFamily: "monospace" }} />
                           <Area type="monotone" dataKey="sentiment" name="GT-Sentiment"
                             stroke="var(--accent)" strokeWidth={1.5}
                             fill="url(#sentimentGrad)"
@@ -2855,7 +2858,7 @@ export default function TrendPulse() {
                             <Cell key={i} fill={i < 2 ? "var(--accent)" : i < 5 ? "var(--accent-secondary)" : "var(--border-accent)"} fillOpacity={0.85} />
                           ))}
                         </Bar>
-                        <Line yAxisId="right" type="monotone" dataKey="cumulative" name="cumulative" stroke="#ffb347" strokeWidth={2} dot={{ fill: "#ffb347", r: 3, strokeWidth: 0 }} />
+                        <Line yAxisId="right" type="monotone" dataKey="cumulative" name="cumulative" stroke="#A0700B" strokeWidth={2} dot={{ fill: "#A0700B", r: 3, strokeWidth: 0 }} />
                       </ComposedChart>
                     </ResponsiveContainer>
                   </div>
@@ -2958,7 +2961,7 @@ export default function TrendPulse() {
                         <Tooltip content={<CustomTooltip />} />
                         <Line type="monotone" dataKey="PC1" stroke="var(--accent)" strokeWidth={1.5} dot={false} activeDot={{ r: 3 }} />
                         {pcaResult.nVars >= 2 && <Line type="monotone" dataKey="PC2" stroke="var(--accent-secondary)" strokeWidth={1.5} dot={false} activeDot={{ r: 3 }} />}
-                        {pcaResult.nVars >= 3 && <Line type="monotone" dataKey="PC3" stroke="#ffb347" strokeWidth={1} dot={false} activeDot={{ r: 3 }} strokeDasharray="4 2" />}
+                        {pcaResult.nVars >= 3 && <Line type="monotone" dataKey="PC3" stroke="#A0700B" strokeWidth={1} dot={false} activeDot={{ r: 3 }} strokeDasharray="4 2" />}
                         <Legend wrapperStyle={{ fontSize: 11, paddingTop: 8 }} />
                         <Brush dataKey="datetime" height={28} stroke="var(--border-accent)" fill="var(--bg-secondary)" tickFormatter={formatAxisDate} />
                       </LineChart>
@@ -3013,12 +3016,12 @@ export default function TrendPulse() {
                 {[
                   { title: "CSV", desc: `One row per UTC time stamp, one column per keyword (column named after the keyword). ${keywords.length} keyword column${keywords.length > 1 ? "s" : ""}.`, icon: "📄", ext: ".csv", handler: exportCSV, color: "var(--accent)" },
                   { title: "CSV (long)", desc: `Long layout with keyword and hits columns. ${flatData.length.toLocaleString()} rows.`, icon: "🧾", ext: ".csv", handler: exportLongCSV, color: "var(--text-muted)" },
-                  { title: "Excel", desc: `Combined sheet + one sheet per keyword. ${keywords.length} keyword sheet${keywords.length > 1 ? "s" : ""}.`, icon: "📊", ext: ".xlsx", handler: exportExcel, color: "#4CAF50" },
-                  { title: "R Script", desc: `gtrendsR loop for all ${keywords.length} keyword${keywords.length > 1 ? "s" : ""} — writes intraday (${freq}) + daily CSVs per keyword plus combined daily.`, icon: "📐", ext: ".R", handler: exportRScript, color: "#2196F3" },
-                  { title: "Stata", desc: "Stata .dta (one variable per keyword, labelled with the keyword; datetime_utc as %tc) plus a .do file with tsset and a plot.", icon: "📈", ext: ".dta + .do", handler: exportStata, color: "#FF9800" },
+                  { title: "Excel", desc: `Combined sheet + one sheet per keyword. ${keywords.length} keyword sheet${keywords.length > 1 ? "s" : ""}.`, icon: "📊", ext: ".xlsx", handler: exportExcel, color: "#2E6F5E" },
+                  { title: "R Script", desc: `gtrendsR loop for all ${keywords.length} keyword${keywords.length > 1 ? "s" : ""} — writes intraday (${freq}) + daily CSVs per keyword plus combined daily.`, icon: "📐", ext: ".R", handler: exportRScript, color: "#2B6CB0" },
+                  { title: "Stata", desc: "Stata .dta (one variable per keyword, labelled with the keyword; datetime_utc as %tc) plus a .do file with tsset and a plot.", icon: "📈", ext: ".dta + .do", handler: exportStata, color: "#B5532A" },
                   { title: "Herding-aligned (40 firms)", desc: "Matches the series to the 1,543 30-minute bins of the 40-firm shipping herding panel (29 Dec 2025 to 26 Mar 2026) by each bin's UTC time: exact time stamp, else the latest earlier value within one native step. Exports .dta and .csv with t_con, period_id and match flags.", icon: "🚢", ext: ".dta + .csv", handler: exportHerdingAligned, color: "#14B8A6" },
-                  { title: "Word Report", desc: `Full .docx report: ${keywords.length} keyword${keywords.length > 1 ? "s" : ""}, collection process, timeline, per-keyword stats (mean, median, variance, skewness, kurtosis), and cutoff comparison if set.`, icon: "📝", ext: ".docx", handler: exportDocx, color: "#2B579A" },
-                  ...(diagnostics.length ? [{ title: "Diagnostics", desc: "Native vs output resolution, duplicated-value share, lag-1 autocorrelation, effective N, window seams and daily-benchmark checks, per keyword.", icon: "🧪", ext: ".csv", handler: exportDiagnosticsCSV, color: "#FBBF24" }] : []),
+                  { title: "Word Report", desc: `Full .docx report: ${keywords.length} keyword${keywords.length > 1 ? "s" : ""}, collection process, timeline, per-keyword stats (mean, median, variance, skewness, kurtosis), and cutoff comparison if set.`, icon: "📝", ext: ".docx", handler: exportDocx, color: "#1F4E79" },
+                  ...(diagnostics.length ? [{ title: "Diagnostics", desc: "Native vs output resolution, duplicated-value share, lag-1 autocorrelation, effective N, window seams and daily-benchmark checks, per keyword.", icon: "🧪", ext: ".csv", handler: exportDiagnosticsCSV, color: "#9A5B00" }] : []),
                   ...(pcaResult ? [{ title: "PCA Scores", desc: `PC scores time series — ${pcaResult.nVars} components × ${pcaResult.nObs.toLocaleString()} observations. PC1 explains ${(pcaResult.explainedVar[0] * 100).toFixed(1)}% of variance.`, icon: "🔬", ext: ".csv", handler: exportPCAcsv, color: "var(--accent-secondary)" }] : []),
                   ...(gtSentiment ? [{ title: "GT Sentiment", desc: `Google Trends Sentiment Index — PC1 normalized 0–100. Mean: ${gtSentiment.mean.toFixed(1)} · Positive: ${gtSentiment.pctPositive.toFixed(1)}% · Negative: ${(100 - gtSentiment.pctPositive).toFixed(1)}%.`, icon: "📡", ext: ".csv", handler: exportGTSentimentCSV, color: "var(--accent)" }] : []),
                 ].map((exp) => (
@@ -3040,13 +3043,13 @@ export default function TrendPulse() {
                 {(herdingSummary || herdingError) && (
                   <div className="md:col-span-2 rounded-xl border border-[var(--border)] bg-[var(--bg-secondary)] p-4 text-xs text-[var(--text-secondary)] space-y-1">
                     <div className="font-semibold text-[var(--text-primary)]">Alignment with the 40-firm herding bins</div>
-                    {herdingError && <div className="text-red-400">{herdingError}</div>}
+                    {herdingError && <div className="text-red-700">{herdingError}</div>}
                     {herdingSummary && (
                       <>
                         <div>Bins: {herdingSummary.nBins.toLocaleString()} · exact time match: {herdingSummary.exact.toLocaleString()} · earlier value (as-of): {herdingSummary.asof.toLocaleString()} · no Trends value: {herdingSummary.none.toLocaleString()}</div>
                         <div>Bins span {herdingSummary.firstBin} to {herdingSummary.lastBin} UTC; the Trends series spans {herdingSummary.seriesStart} to {herdingSummary.seriesEnd} UTC.</div>
                         <div>The herding bins are defined in exchange-local time: {herdingSummary.nBins - herdingSummary.uniqueUtcTimes} bins share a UTC time with another bin and the UTC order reverses {herdingSummary.nonMonotonic} times. Each bin is matched at the UTC time stored in the panel.</div>
-                        {herdingSummary.none > 0 && <div className="text-amber-400">Some bins have no Trends value: widen the date range to cover 29 Dec 2025 to 26 Mar 2026.</div>}
+                        {herdingSummary.none > 0 && <div className="text-amber-700">Some bins have no Trends value: widen the date range to cover 29 Dec 2025 to 26 Mar 2026.</div>}
                       </>
                     )}
                   </div>

@@ -63,7 +63,7 @@ export default function ResolutionComparison({ data, keywords }: { data: Record<
         </div>
 
         {data[cur]?.anchored && (
-          <p className="text-[11px] text-amber-400 leading-relaxed">
+          <p className="text-[11px] text-amber-700 leading-relaxed">
             This series was anchored to the daily benchmark, so its agreement with the daily series is partly by construction and is not an independent check.
           </p>
         )}
@@ -113,11 +113,11 @@ export default function ResolutionComparison({ data, keywords }: { data: Record<
               <YAxis domain={[0, "auto"]} tick={axis} axisLine={false} tickLine={false} width={35} />
               <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border)", fontSize: 11 }} />
               <Legend wrapperStyle={{ fontSize: 11 }} />
-              <Area type="monotone" dataKey="m30Band" name="30-min 95% band (naive)" stroke="none" fill="#f59e0b" fillOpacity={0.15} isAnimationActive={false} />
-              <Area type="monotone" dataKey="hourlyBand" name="Hourly 95% band" stroke="none" fill="#38bdf8" fillOpacity={0.22} isAnimationActive={false} />
-              <Line type="monotone" dataKey="m30" name="30-min (daily mean)" stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="4 3" dot={false} isAnimationActive={false} />
-              <Line type="monotone" dataKey="hourly" name="Hourly (daily mean)" stroke="#38bdf8" strokeWidth={1.8} dot={false} isAnimationActive={false} />
-              <Line type="monotone" dataKey="daily" name="Daily (Google benchmark)" stroke="#34d399" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+              <Area type="monotone" dataKey="m30Band" name="30-min 95% band (naive)" stroke="none" fill="#A0700B" fillOpacity={0.15} isAnimationActive={false} />
+              <Area type="monotone" dataKey="hourlyBand" name="Hourly 95% band" stroke="none" fill="#2B6CB0" fillOpacity={0.22} isAnimationActive={false} />
+              <Line type="monotone" dataKey="m30" name="30-min (daily mean)" stroke="#A0700B" strokeWidth={1.5} strokeDasharray="4 3" dot={false} isAnimationActive={false} />
+              <Line type="monotone" dataKey="hourly" name="Hourly (daily mean)" stroke="#2B6CB0" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+              <Line type="monotone" dataKey="daily" name="Daily (Google benchmark)" stroke="#2E6F5E" strokeWidth={1.8} dot={false} isAnimationActive={false} />
             </ComposedChart>
           </ResponsiveContainer>
         </div>
@@ -142,9 +142,9 @@ export default function ResolutionComparison({ data, keywords }: { data: Record<
                 <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border)", fontSize: 11 }} />
                 <Legend wrapperStyle={{ fontSize: 11 }} />
                 <ReferenceLine y={0} stroke="var(--border-accent)" />
-                <Area type="monotone" dataKey="band" name="95% CI (hourly vs daily)" stroke="none" fill="#38bdf8" fillOpacity={0.22} isAnimationActive={false} />
-                <Line type="monotone" dataKey="rHourly" name="Hourly vs daily" stroke="#38bdf8" strokeWidth={1.8} dot={false} isAnimationActive={false} />
-                <Line type="monotone" dataKey="rM30" name="30-min vs daily" stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="4 3" dot={false} isAnimationActive={false} />
+                <Area type="monotone" dataKey="band" name="95% CI (hourly vs daily)" stroke="none" fill="#2B6CB0" fillOpacity={0.22} isAnimationActive={false} />
+                <Line type="monotone" dataKey="rHourly" name="Hourly vs daily" stroke="#2B6CB0" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+                <Line type="monotone" dataKey="rM30" name="30-min vs daily" stroke="#A0700B" strokeWidth={1.5} strokeDasharray="4 3" dot={false} isAnimationActive={false} />
               </ComposedChart>
             </ResponsiveContainer>
           </div>
